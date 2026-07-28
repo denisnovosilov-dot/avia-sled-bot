@@ -6,6 +6,7 @@ import sys
 import logging
 import sqlite3
 import re
+import time
 from datetime import datetime, timedelta
 from threading import Lock
 from dotenv import load_dotenv
@@ -36,7 +37,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger(__name__)
 
 # === Состояния ===
-TYPE, ORIGIN, DEST, DATE_FROM, DATE_TO, ROUND_TRIP, PRICE, CITY_INPUT = range(8)
+TYPE, ORIGIN, DEST, DATE_FROM, DATE_TO, ROUND_TRIP, PRICE, CITY_INPUT, EDIT_SUB = range(9)
 
 # === База данных ===
 DB_NAME = "subscriptions.db"
@@ -81,6 +82,15 @@ def get_subs(active_only=True):
         conn.close()
         return rows
 
+def get_sub_by_id(sub_id, user_id):
+    with lock:
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        c.execute("SELECT id, user_id, type, origin, dest, date_from, date_to, max_price, active, round_trip FROM subs WHERE id=? AND user_id=?", (sub_id, user_id))
+        row = c.fetchone()
+        conn.close()
+        return row
+
 def add_sub(user_id, typ, origin, dest, d_from, d_to, max_price=None, round_trip=1):
     with lock:
         conn = sqlite3.connect(DB_NAME)
@@ -88,6 +98,25 @@ def add_sub(user_id, typ, origin, dest, d_from, d_to, max_price=None, round_trip
         c.execute('''INSERT INTO subs (user_id, type, origin, dest, date_from, date_to, max_price, active, round_trip)
                      VALUES (?,?,?,?,?,?,?,1,?)''',
                   (user_id, typ, origin, dest, d_from, d_to, max_price, round_trip))
+        conn.commit()
+        conn.close()
+
+def update_sub(sub_id, user_id, origin=None, dest=None, date_from=None, date_to=None, max_price=None, round_trip=None):
+    with lock:
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        if origin:
+            c.execute("UPDATE subs SET origin=? WHERE id=? AND user_id=?", (origin, sub_id, user_id))
+        if dest:
+            c.execute("UPDATE subs SET dest=? WHERE id=? AND user_id=?", (dest, sub_id, user_id))
+        if date_from:
+            c.execute("UPDATE subs SET date_from=? WHERE id=? AND user_id=?", (date_from, sub_id, user_id))
+        if date_to is not None:
+            c.execute("UPDATE subs SET date_to=? WHERE id=? AND user_id=?", (date_to, sub_id, user_id))
+        if max_price is not None:
+            c.execute("UPDATE subs SET max_price=? WHERE id=? AND user_id=?", (max_price, sub_id, user_id))
+        if round_trip is not None:
+            c.execute("UPDATE subs SET round_trip=? WHERE id=? AND user_id=?", (round_trip, sub_id, user_id))
         conn.commit()
         conn.close()
 
@@ -135,12 +164,17 @@ CITIES = {
 }
 
 # === Функция поиска через Aviasales (исправленная) ===
-def fetch_aviasales(origin, dest, date_list):
+def fetch_aviasales(origin, dest, date_list, max_price=None):
+    """
+    Ищет цены на заданные даты через API Aviasales.
+    Возвращает список билетов с ценой и ссылкой.
+    """
     results = []
     url = "https://api.travelpayouts.com/v1/prices/calendar"
     for date_str in date_list:
         params = {
-            "origin": origin, "destination": dest,
+            "origin": origin,
+            "destination": dest,
             "depart_date": date_str,
             "token": AVIASALES_TOKEN,
             "currency": "rub",
@@ -151,20 +185,66 @@ def fetch_aviasales(origin, dest, date_list):
             if resp.status_code == 200:
                 data = resp.json()
                 if data.get("success") and data.get("data"):
-                    # data — это объект, ключи — даты, значение — информация о билете
                     for d, info in data["data"].items():
                         price = info.get("price")
                         if price is not None:
-                            link = f"https://www.aviasales.ru/search/{origin}{dest}{d}"
-                            results.append({"date": d, "price": price, "link": link})
-                            break  # берём первую найденную цену для этой даты
+                            # Правильная ссылка на Aviasales
+                            link = f"https://www.aviasales.ru/search/{origin}/{dest}/{d}"
+                            if max_price is None or price <= max_price:
+                                results.append({"date": d, "price": price, "link": link})
+                            break
                 else:
                     logger.warning(f"Aviasales вернул ошибку: {data}")
         except Exception as e:
             logger.error(f"Ошибка Aviasales: {e}")
     return results
 
-# === Умный поиск с расширением дат ±3 дня ===
+# === Функция поиска субсидий через API Аэрофлота с имитацией браузера ===
+def fetch_aeroflot_subsidy(origin, dest, date_list, category='SRC'):
+    results = []
+    url = "https://www.aeroflot.ru/api/ru-RU/search/flights"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Referer": "https://www.aeroflot.ru/ru-ru/pbsa/search",
+        "Origin": "https://www.aeroflot.ru",
+        "Connection": "keep-alive",
+        "Cache-Control": "no-cache",
+    }
+    session = requests.Session()
+    # Добавляем куки, чтобы имитировать сессию
+    session.get("https://www.aeroflot.ru/ru-ru/pbsa/search", headers=headers, timeout=10)
+    time.sleep(2)  # имитация задержки браузера
+
+    for date_str in date_list:
+        payload = {
+            "origin": origin,
+            "destination": dest,
+            "departureDate": date_str,
+            "adultCount": 1,
+            "childCount": 0,
+            "infantCount": 0,
+            "cabin": "Y",
+            "fareType": category,
+        }
+        try:
+            resp = session.post(url, json=payload, headers=headers, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                for seg in data.get("segments", []):
+                    if seg.get("fareType") == "SUB" or seg.get("isSubsidized"):
+                        price = seg.get("price", {}).get("amount", 0)
+                        link = f"https://www.aeroflot.ru/ru-ru/pbsa/search?origin={origin}&destination={dest}&date={date_str}"
+                        results.append({"date": date_str, "price": int(price) if price else 0, "link": link})
+                        break
+            else:
+                logger.warning(f"Аэрофлот вернул статус {resp.status_code}: {resp.text[:200]}")
+        except Exception as e:
+            logger.error(f"Ошибка Аэрофлота: {e}")
+    return results
+
+# === Умный поиск с расширением дат ±3 дня (для мониторинга) ===
 def expand_dates(date_from, date_to=None, days=3):
     start = datetime.strptime(date_from, "%Y-%m-%d")
     if date_to:
@@ -176,6 +256,20 @@ def expand_dates(date_from, date_to=None, days=3):
     dates = []
     cur = start_exp
     while cur <= end_exp:
+        dates.append(cur.strftime("%Y-%m-%d"))
+        cur += timedelta(days=1)
+    return dates
+
+# === Генерация дат в диапазоне (без расширения) ===
+def dates_in_range(date_from, date_to=None):
+    start = datetime.strptime(date_from, "%Y-%m-%d")
+    if date_to:
+        end = datetime.strptime(date_to, "%Y-%m-%d")
+    else:
+        end = start
+    dates = []
+    cur = start
+    while cur <= end:
         dates.append(cur.strftime("%Y-%m-%d"))
         cur += timedelta(days=1)
     return dates
@@ -242,6 +336,7 @@ async def new_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     keyboard = [
         [InlineKeyboardButton("💰 Дешёвые (Aviasales)", callback_data="type_aviasales")],
+        [InlineKeyboardButton("🛫 Субсидированные (Аэрофлот)", callback_data="type_subsidy")],
         [InlineKeyboardButton("↩️ Назад", callback_data="back")]
     ]
     await query.edit_message_text("Выберите тип билетов:", reply_markup=InlineKeyboardMarkup(keyboard))
@@ -250,7 +345,8 @@ async def new_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def type_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    # Мы всегда используем Aviasales
+    typ = query.data.split("_")[1]
+    context.user_data['type'] = typ
     keyboard = []
     for city, code in CITIES.items():
         keyboard.append([InlineKeyboardButton(f"{city} ({code})", callback_data=f"origin_{code}")])
@@ -529,7 +625,7 @@ async def price_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def finish(update, context):
     user_id = update.effective_user.id
-    typ = "aviasales"  # всегда aviasales
+    typ = context.user_data['type']
     origin = context.user_data['origin']
     dest = context.user_data['dest']
     d_from = context.user_data['date_from']
@@ -550,25 +646,28 @@ async def finish(update, context):
     else:
         await update.message.reply_text("✅ Подписка добавлена!")
     if sub_id:
-        await immediate_check(update, context, sub_id, user_id, origin, dest, d_from, d_to, max_price)
+        await immediate_check(update, context, sub_id, user_id, typ, origin, dest, d_from, d_to, max_price)
     return ConversationHandler.END
 
-async def immediate_check(update, context, sub_id, user_id, origin, dest, d_from, d_to, max_price):
-    date_list = expand_dates(d_from, d_to, days=3)
-    tickets = fetch_aviasales(origin, dest, date_list)
+async def immediate_check(update, context, sub_id, user_id, typ, origin, dest, d_from, d_to, max_price):
+    # Ищем только на точные даты, указанные пользователем (без расширения)
+    date_list = dates_in_range(d_from, d_to)
+    if typ == 'aviasales':
+        tickets = fetch_aviasales(origin, dest, date_list, max_price)
+    else:
+        tickets = fetch_aeroflot_subsidy(origin, dest, date_list)
     found = False
     for t in tickets:
-        if max_price is None or t['price'] <= max_price:
-            keyboard = [[InlineKeyboardButton("✈️ Купить", url=t["link"])]]
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=f"💰 БИЛЕТ ПО ВАШЕЙ ЦЕНЕ!\n📍 {origin}→{dest}\n📅 {t['date']}\n💵 {t['price']} ₽" + (f" (порог {max_price} ₽)" if max_price else ""),
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
-            add_found(sub_id, t['date'], t['price'], t['link'])
-            found = True
+        keyboard = [[InlineKeyboardButton("✈️ Купить", url=t["link"])]]
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=f"{'💰 БИЛЕТ ПО ВАШЕЙ ЦЕНЕ!' if typ=='aviasales' else '🎫 СУБСИДИРОВАННЫЙ БИЛЕТ!'}\n📍 {origin}→{dest}\n📅 {t['date']}\n💵 {t['price']} ₽" + (f" (порог {max_price} ₽)" if max_price else ""),
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        add_found(sub_id, t['date'], t['price'], t['link'])
+        found = True
     if not found:
-        await context.bot.send_message(chat_id=user_id, text="🔍 Пока билетов по вашей цене нет. Будем отслеживать с запасом ±3 дня.")
+        await context.bot.send_message(chat_id=user_id, text="🔍 Пока билетов по вашим условиям нет. Будем отслеживать с запасом ±3 дня.")
 
 # === Список подписок ===
 async def list_subs(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -595,6 +694,7 @@ async def list_subs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             row.append(InlineKeyboardButton("▶️", callback_data=f"resume_{sub_id}"))
         row.append(InlineKeyboardButton("❌", callback_data=f"delete_{sub_id}"))
+        row.append(InlineKeyboardButton("✏️", callback_data=f"edit_{sub_id}"))
         row.append(InlineKeyboardButton("📊", callback_data=f"found_{sub_id}"))
         keyboard.append(row)
     keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="back")])
@@ -615,12 +715,32 @@ async def manage_sub(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     sub_id = int(sub_id_str)
     user_id = update.effective_user.id
+
     if action == "pause":
         toggle_sub(sub_id, user_id, 0)
+        await list_subs(update, context)
     elif action == "resume":
         toggle_sub(sub_id, user_id, 1)
+        await list_subs(update, context)
     elif action == "delete":
         delete_sub(sub_id, user_id)
+        await list_subs(update, context)
+    elif action == "edit":
+        # Начинаем редактирование – сохраняем sub_id и переходим к выбору нового значения
+        context.user_data['edit_sub_id'] = sub_id
+        sub = get_sub_by_id(sub_id, user_id)
+        if not sub:
+            await query.edit_message_text("Подписка не найдена.")
+            return
+        # Предлагаем изменить поля
+        keyboard = [
+            [InlineKeyboardButton("📅 Изменить даты", callback_data="edit_dates")],
+            [InlineKeyboardButton("💰 Изменить цену", callback_data="edit_price")],
+            [InlineKeyboardButton("📍 Изменить направление", callback_data="edit_direction")],
+            [InlineKeyboardButton("↩️ Назад", callback_data="back_to_list")]
+        ]
+        await query.edit_message_text("Выберите, что хотите изменить:", reply_markup=InlineKeyboardMarkup(keyboard))
+        return EDIT_SUB
     elif action == "found":
         found = get_found(sub_id)
         if not found:
@@ -631,6 +751,109 @@ async def manage_sub(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text += f"📅 {f[0]}, 💵 {f[1]} ₽\n{f[2]}\n\n"
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="back")]]))
         return
+
+async def edit_sub_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    sub_id = context.user_data.get('edit_sub_id')
+    user_id = update.effective_user.id
+    if not sub_id:
+        await query.edit_message_text("Ошибка: не выбрана подписка.")
+        return
+    if data == "edit_dates":
+        # Запросить новые даты (можно через контекст)
+        context.user_data['edit_field'] = 'dates'
+        await query.edit_message_text("Введите новые даты в формате ДД.ММ.ГГГГ-ДД.ММ.ГГГГ (или одну дату):")
+        return ConversationHandler.END  # временно завершаем, чтобы потом обработать ввод
+    elif data == "edit_price":
+        context.user_data['edit_field'] = 'price'
+        await query.edit_message_text("Введите новую цену (или 'skip' для удаления порога):")
+        return ConversationHandler.END
+    elif data == "edit_direction":
+        context.user_data['edit_field'] = 'direction'
+        await query.edit_message_text("Введите новое направление в формате 'ОТКУДА КУДА' (например, MOW LED):")
+        return ConversationHandler.END
+    elif data == "back_to_list":
+        await list_subs(update, context)
+        return ConversationHandler.END
+
+# === Обработка текстового ввода для редактирования ===
+async def handle_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    user_id = update.effective_user.id
+    sub_id = context.user_data.get('edit_sub_id')
+    field = context.user_data.get('edit_field')
+    if not sub_id or not field:
+        await update.message.reply_text("Ошибка: неизвестная операция.")
+        return
+    sub = get_sub_by_id(sub_id, user_id)
+    if not sub:
+        await update.message.reply_text("Подписка не найдена.")
+        return
+
+    if field == 'dates':
+        # Парсим диапазон дат
+        if '-' in text:
+            parts = text.split('-')
+            if len(parts) != 2:
+                await update.message.reply_text("Неверный формат. Используйте ДД.ММ.ГГГГ-ДД.ММ.ГГГГ")
+                return
+            d1 = parts[0].strip(); d2 = parts[1].strip()
+            try:
+                d1_obj = datetime.strptime(d1, "%d.%m.%Y")
+                d2_obj = datetime.strptime(d2, "%d.%m.%Y")
+            except:
+                await update.message.reply_text("Неверный формат даты. Используйте ДД.ММ.ГГГГ.")
+                return
+            if d1_obj.date() < datetime.now().date() or d2_obj.date() < datetime.now().date():
+                await update.message.reply_text("Даты не могут быть в прошлом.")
+                return
+            if d2_obj < d1_obj:
+                await update.message.reply_text("Дата возврата не может быть раньше даты вылета.")
+                return
+            date_from = d1_obj.strftime("%Y-%m-%d")
+            date_to = d2_obj.strftime("%Y-%m-%d")
+            update_sub(sub_id, user_id, date_from=date_from, date_to=date_to)
+        else:
+            try:
+                d1_obj = datetime.strptime(text, "%d.%m.%Y")
+            except:
+                await update.message.reply_text("Неверный формат даты. Используйте ДД.ММ.ГГГГ.")
+                return
+            if d1_obj.date() < datetime.now().date():
+                await update.message.reply_text("Дата не может быть в прошлом.")
+                return
+            date_from = d1_obj.strftime("%Y-%m-%d")
+            date_to = None
+            update_sub(sub_id, user_id, date_from=date_from, date_to=date_to)
+        await update.message.reply_text("✅ Даты обновлены.")
+    elif field == 'price':
+        if text.lower() == 'skip':
+            new_price = None
+        else:
+            try:
+                new_price = int(text)
+            except:
+                await update.message.reply_text("Введите число или 'skip'.")
+                return
+        update_sub(sub_id, user_id, max_price=new_price)
+        await update.message.reply_text(f"✅ Цена обновлена: {new_price if new_price is not None else 'без ограничений'}.")
+    elif field == 'direction':
+        parts = text.split()
+        if len(parts) != 2:
+            await update.message.reply_text("Введите два IATA-кода через пробел (например, MOW LED).")
+            return
+        origin = parts[0].upper()
+        dest = parts[1].upper()
+        # Проверим, что коды есть в списке (или можно принять любые)
+        update_sub(sub_id, user_id, origin=origin, dest=dest)
+        await update.message.reply_text(f"✅ Направление обновлено: {origin} → {dest}.")
+    else:
+        await update.message.reply_text("Неизвестное поле.")
+        return
+    # После успешного редактирования показываем список подписок
+    context.user_data.clear()
     await list_subs(update, context)
 
 async def show_all_found(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -672,10 +895,11 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     await query.edit_message_text(
-        "🤖 Бот ищет дешёвые билеты через Aviasales.\n"
+        "🤖 Бот ищет дешёвые билеты через Aviasales и субсидированные Аэрофлота.\n"
         "➕ Умный поиск ±3 дня, если на точные даты нет билетов.\n"
         "💰 Цену можно пропустить.\n"
-        "📊 История найденных билетов.",
+        "📊 История найденных билетов.\n"
+        "✏️ Редактирование подписок: изменить даты, цену, направление.",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="back")]])
     )
 
@@ -691,7 +915,7 @@ async def back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     await query.edit_message_text("✈️ Главное меню:", reply_markup=InlineKeyboardMarkup(keyboard))
 
-# === Периодическая проверка ===
+# === Периодическая проверка (с расширением ±3 дня) ===
 def check_all(context: ContextTypes.DEFAULT_TYPE):
     subs = get_subs(active_only=True)
     for sub in subs:
@@ -699,16 +923,18 @@ def check_all(context: ContextTypes.DEFAULT_TYPE):
         if active != 1:
             continue
         date_list = expand_dates(d_from, d_to, days=3)
-        tickets = fetch_aviasales(origin, dest, date_list)
+        if typ == 'aviasales':
+            tickets = fetch_aviasales(origin, dest, date_list, max_price)
+        else:
+            tickets = fetch_aeroflot_subsidy(origin, dest, date_list)
         for t in tickets:
-            if max_price is None or t['price'] <= max_price:
-                add_found(sub_id, t["date"], t["price"], t["link"])
-                keyboard = [[InlineKeyboardButton("✈️ Купить", url=t["link"])]]
-                context.bot.send_message(
-                    chat_id=user_id,
-                    text=f"💰 НАЙДЕН БИЛЕТ!\n📍 {origin}→{dest}\n📅 {t['date']}\n💵 {t['price']} ₽" + (f" (порог {max_price} ₽)" if max_price else ""),
-                    reply_markup=InlineKeyboardMarkup(keyboard)
-                )
+            add_found(sub_id, t["date"], t["price"], t["link"])
+            keyboard = [[InlineKeyboardButton("✈️ Купить", url=t["link"])]]
+            context.bot.send_message(
+                chat_id=user_id,
+                text=f"{'💰 НАЙДЕН БИЛЕТ!' if typ=='aviasales' else '🎫 СУБСИДИРОВАННЫЙ БИЛЕТ!'}\n📍 {origin}→{dest}\n📅 {t['date']}\n💵 {t['price']} ₽" + (f" (порог {max_price} ₽)" if max_price else ""),
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
 
 # === Main ===
 def main():
@@ -739,11 +965,13 @@ def main():
     app.add_handler(conv)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(list_subs, pattern="^list$"))
-    app.add_handler(CallbackQueryHandler(manage_sub, pattern="^(pause|resume|delete|found)_\d+$"))
+    app.add_handler(CallbackQueryHandler(manage_sub, pattern="^(pause|resume|delete|edit|found)_\d+$"))
+    app.add_handler(CallbackQueryHandler(edit_sub_callback, pattern="^edit_(dates|price|direction|back_to_list)$"))
     app.add_handler(CallbackQueryHandler(pause_all, pattern="^pause_all$"))
     app.add_handler(CallbackQueryHandler(help_cmd, pattern="^help$"))
     app.add_handler(CallbackQueryHandler(back, pattern="^back$"))
     app.add_handler(CallbackQueryHandler(show_all_found, pattern="^show_found$"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit_text))
 
     scheduler = BackgroundScheduler()
     scheduler.add_job(check_all, 'interval', minutes=CHECK_INTERVAL, args=[app])
