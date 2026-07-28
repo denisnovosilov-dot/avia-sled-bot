@@ -140,13 +140,11 @@ AIRLINES = ["Аэрофлот", "S7", "Победа", "Уральские ави
 
 # === Умный поиск с запасом ±3 дня ===
 def expand_dates(date_from, date_to=None, days=3):
-    """Генерирует список дат для поиска: от date_from±days до date_to±days."""
     start = datetime.strptime(date_from, "%Y-%m-%d")
     if date_to:
         end = datetime.strptime(date_to, "%Y-%m-%d")
     else:
         end = start
-    # Расширяем диапазон
     start_exp = start - timedelta(days=days)
     end_exp = end + timedelta(days=days)
     dates = []
@@ -158,7 +156,6 @@ def expand_dates(date_from, date_to=None, days=3):
 
 # === Функции поиска ===
 def fetch_subsidy(origin, dest, date_list, category='SRC'):
-    """Ищет субсидированные билеты на указанные даты."""
     results = []
     url = "https://www.aeroflot.ru/api/ru-RU/search/flights"
     headers = {"User-Agent": "Mozilla/5.0", "Content-Type": "application/json"}
@@ -184,7 +181,6 @@ def fetch_subsidy(origin, dest, date_list, category='SRC'):
     return results
 
 def fetch_aviasales(origin, dest, date_list):
-    """Ищет цены через Aviasales API на указанные даты."""
     results = []
     url = "https://api.travelpayouts.com/v1/prices/calendar"
     for date_str in date_list:
@@ -263,7 +259,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("❓ Помощь", callback_data="help")],
         [InlineKeyboardButton("⏸ Приостановить все", callback_data="pause_all")]
     ]
-    await update.message.reply_text("✈️ Привет! Выберите действие:", reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text("✈️ Главное меню:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def new_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -338,7 +334,6 @@ async def dest_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return CITY_INPUT
     else:
         context.user_data['dest'] = data.split("_")[1]
-        # Спросить, нужна ли обратная дата
         keyboard = [
             [InlineKeyboardButton("✅ Да, туда и обратно", callback_data="round_yes")],
             [InlineKeyboardButton("➡️ Только туда", callback_data="round_no")],
@@ -361,7 +356,6 @@ async def round_trip_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return DATE_FROM
     else:
         context.user_data['round_trip'] = 0
-        # Сразу переходим к выбору даты вылета (date_to не нужна)
         now = datetime.now()
         await query.edit_message_text(
             "📅 Выберите дату вылета (или введите в формате ДД.ММ.ГГГГ):",
@@ -377,7 +371,6 @@ async def dest_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
             break
     else:
         context.user_data['dest'] = text
-    # Спросить про обратную дату
     keyboard = [
         [InlineKeyboardButton("✅ Да, туда и обратно", callback_data="round_yes")],
         [InlineKeyboardButton("➡️ Только туда", callback_data="round_no")],
@@ -396,7 +389,6 @@ async def calendar_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if prefix == "ignore":
         return
 
-    # Обработка навигации
     if len(parts) >= 4 and parts[1] in ("prev", "next"):
         action = parts[1]
         year = int(parts[2])
@@ -436,7 +428,6 @@ async def calendar_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if prefix == "from":
         context.user_data['date_from'] = date_str
         if context.user_data.get('round_trip') == 1:
-            # Если нужен обратный билет, просим дату возврата
             await query.edit_message_text(
                 f"✅ Вылет: {date_str}\nТеперь выберите дату возврата (или введите в формате ДД.ММ.ГГГГ):",
                 reply_markup=build_calendar(selected_date.year, selected_date.month, "to")
@@ -444,9 +435,7 @@ async def calendar_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data['calendar_prefix'] = "to"
             return DATE_TO
         else:
-            # Только туда
-            context.user_data['date_to'] = None  # нет обратной даты
-            # Переходим к цене или завершению
+            context.user_data['date_to'] = None
             if context.user_data.get('type') == 'aviasales':
                 keyboard = [
                     [InlineKeyboardButton("5000", callback_data="price_5000"),
@@ -463,7 +452,6 @@ async def calendar_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return await finish(update, context)
     elif prefix == "to":
         context.user_data['date_to'] = date_str
-        # Переход к цене или завершению
         if context.user_data.get('type') == 'aviasales':
             keyboard = [
                 [InlineKeyboardButton("5000", callback_data="price_5000"),
@@ -482,7 +470,6 @@ async def calendar_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Неизвестная команда.")
         return
 
-# Обработка текстового ввода дат
 async def handle_date_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     pattern = r'^(\d{2})\.(\d{2})\.(\d{4})$'
@@ -498,7 +485,6 @@ async def handle_date_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     date_str = selected.strftime("%Y-%m-%d")
     context.user_data['date_from'] = date_str
     if context.user_data.get('round_trip') == 1:
-        # Требуем дату возврата
         await update.message.reply_text(
             f"✅ Вылет: {date_str}\nТеперь введите дату возврата (ДД.ММ.ГГГГ):",
             reply_markup=build_calendar(selected.year, selected.month, "to")
@@ -559,7 +545,7 @@ async def price_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Введите цену числом (только цифры):")
         return PRICE
     elif data == "price_skip":
-        context.user_data['max_price'] = None  # без ограничения
+        context.user_data['max_price'] = None
         return await show_airlines(update, context)
     else:
         context.user_data['max_price'] = int(data.split("_")[1])
@@ -613,27 +599,23 @@ async def finish(update, context):
     airline = context.user_data.get('airline')
     round_trip = 1 if context.user_data.get('round_trip') == 1 else 0
     if not d_to and round_trip == 1:
-        d_to = d_from  # если туда-обратно, но не ввели обратную, ставим ту же
+        d_to = d_from
     add_sub(user_id, typ, origin, dest, d_from, d_to, max_price, category, airline, round_trip)
-    # Получаем id новой подписки
     subs = get_subs(active_only=False)
     user_subs = [s for s in subs if s[1] == user_id]
     sub_id = user_subs[-1][0] if user_subs else None
     context.user_data.clear()
-
     if update.callback_query:
         await update.callback_query.edit_message_text(
             f"✅ Подписка добавлена!\n📍 {origin} → {dest}\n📅 {d_from}" + (f" – {d_to}" if d_to else "")
         )
     else:
         await update.message.reply_text("✅ Подписка добавлена!")
-
     if sub_id:
         await immediate_check(update, context, sub_id, user_id, typ, origin, dest, d_from, d_to, max_price, category)
     return ConversationHandler.END
 
 async def immediate_check(update, context, sub_id, user_id, typ, origin, dest, d_from, d_to, max_price, category):
-    # Генерируем список дат для поиска (с запасом ±3 дня)
     date_list = expand_dates(d_from, d_to, days=3)
     if typ == 'subsidy':
         tickets = fetch_subsidy(origin, dest, date_list, category)
@@ -648,7 +630,7 @@ async def immediate_check(update, context, sub_id, user_id, typ, origin, dest, d
                 add_found(sub_id, t['date'], t['price'], t['link'])
         else:
             await context.bot.send_message(chat_id=user_id, text="🔍 Пока билетов нет. Будем отслеживать с запасом ±3 дня.")
-    else:  # aviasales
+    else:
         tickets = fetch_aviasales(origin, dest, date_list)
         found = False
         for t in tickets:
@@ -700,7 +682,14 @@ async def manage_sub(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     parts = data.split("_")
     action = parts[0]
-    sub_id = int(parts[1])
+    if len(parts) < 2:
+        await query.edit_message_text("Ошибка.")
+        return
+    sub_id_str = parts[1]
+    if not sub_id_str.isdigit():
+        await query.edit_message_text("Ошибка ID.")
+        return
+    sub_id = int(sub_id_str)
     user_id = update.effective_user.id
     if action == "pause":
         toggle_sub(sub_id, user_id, 0)
@@ -709,7 +698,6 @@ async def manage_sub(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "delete":
         delete_sub(sub_id, user_id)
     elif action == "found":
-        # Показать найденные билеты
         found = get_found(sub_id)
         if not found:
             await query.edit_message_text("📭 Нет найденных билетов для этой подписки.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="back")]]))
@@ -721,7 +709,6 @@ async def manage_sub(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await list_subs(update, context)
 
-# === Показать найденные билеты для всех подписок ===
 async def show_all_found(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -753,7 +740,7 @@ async def pause_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     subs = get_subs(active_only=False)
     for s in subs:
-        if s[1] == user_id and s[10] == 1:  # active
+        if s[1] == user_id and s[10] == 1:
             toggle_sub(s[0], user_id, 0)
     await query.edit_message_text("⏸ Все подписки приостановлены.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="back")]]))
 
@@ -840,7 +827,7 @@ def main():
     app.add_handler(conv)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(list_subs, pattern="^list$"))
-    app.add_handler(CallbackQueryHandler(manage_sub, pattern="^(pause|resume|delete|found)_"))
+    app.add_handler(CallbackQueryHandler(manage_sub, pattern="^(pause|resume|delete|found)_\d+$"))
     app.add_handler(CallbackQueryHandler(pause_all, pattern="^pause_all$"))
     app.add_handler(CallbackQueryHandler(help_cmd, pattern="^help$"))
     app.add_handler(CallbackQueryHandler(back, pattern="^back$"))
