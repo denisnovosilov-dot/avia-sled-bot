@@ -162,12 +162,11 @@ AIRLINES = ["Аэрофлот", "S7", "Победа", "Уральские ави
 PASSENGER_TYPES = [
     ("Молодёжь (до 23 лет)", "YTH"),
     ("Пенсионеры (женщины 55+, мужчины 60+)", "SRC"),
-    ("Субсидированный (общий)", "SRC"),  # фактически тот же, но для единообразия
+    ("Субсидированный (общий)", "SRC"),
 ]
 
 # === Функции поиска ===
 def fetch_aviasales(origin, dest, date_list, max_price=None, airline=None):
-    """Ищет цены на Aviasales через API."""
     results = []
     url = "https://api.travelpayouts.com/v1/prices/calendar"
     for date_str in date_list:
@@ -179,7 +178,6 @@ def fetch_aviasales(origin, dest, date_list, max_price=None, airline=None):
             "currency": "rub",
             "show_to_affiliates": "true"
         }
-        # Если указана авиакомпания, передаём её (если поддерживается)
         if airline and airline != "Любая":
             params["airline"] = airline
         try:
@@ -201,10 +199,7 @@ def fetch_aviasales(origin, dest, date_list, max_price=None, airline=None):
     return results
 
 def fetch_aeroflot_subsidy(origin, dest, date_list, passenger_type='YTH'):
-    """Ищет субсидированные билеты через API Аэрофлота с категорией пассажира."""
     results = []
-    # passenger_type может быть YTH, SRC, CNN и др.
-    # В API это передаётся как fareType
     url = "https://www.aeroflot.ru/api/ru-RU/search/flights"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
@@ -216,9 +211,8 @@ def fetch_aeroflot_subsidy(origin, dest, date_list, passenger_type='YTH'):
         "Cache-Control": "no-cache",
     }
     session = requests.Session()
-    # Имитация браузера
     session.get("https://www.aeroflot.ru/ru-ru/pbsa/search", headers=headers, timeout=10)
-    time.sleep(2)  # задержка
+    time.sleep(2)
 
     for date_str in date_list:
         payload = {
@@ -229,13 +223,12 @@ def fetch_aeroflot_subsidy(origin, dest, date_list, passenger_type='YTH'):
             "childCount": 0,
             "infantCount": 0,
             "cabin": "Y",
-            "fareType": passenger_type,  # YTH, SRC и т.д.
+            "fareType": passenger_type,
         }
         try:
             resp = session.post(url, json=payload, headers=headers, timeout=10)
             if resp.status_code == 200:
                 data = resp.json()
-                # Ищем сегменты с субсидией (fareType == SUB или isSubsidized)
                 for seg in data.get("segments", []):
                     if seg.get("fareType") == "SUB" or seg.get("isSubsidized"):
                         price = seg.get("price", {}).get("amount", 0)
@@ -250,7 +243,6 @@ def fetch_aeroflot_subsidy(origin, dest, date_list, passenger_type='YTH'):
 
 # === Вспомогательные функции для дат ===
 def expand_dates(date_from, date_to=None, days=3):
-    """Расширяет диапазон дат на ±days дней."""
     start = datetime.strptime(date_from, "%Y-%m-%d")
     if date_to:
         end = datetime.strptime(date_to, "%Y-%m-%d")
@@ -266,7 +258,6 @@ def expand_dates(date_from, date_to=None, days=3):
     return dates
 
 def dates_in_range(date_from, date_to=None):
-    """Генерирует все даты от date_from до date_to включительно."""
     start = datetime.strptime(date_from, "%Y-%m-%d")
     if date_to:
         end = datetime.strptime(date_to, "%Y-%m-%d")
@@ -280,7 +271,6 @@ def dates_in_range(date_from, date_to=None):
     return dates
 
 def generate_date_range_for_any_date(max_days=30):
-    """Для режима 'любая дата' генерируем диапазон от сегодня до сегодня+max_days."""
     today = datetime.now()
     end = today + timedelta(days=max_days)
     dates = []
@@ -363,7 +353,6 @@ async def type_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     typ = query.data.split("_")[1]
     context.user_data['type'] = typ
-    # Если это субсидия, спросим категорию пассажира
     if typ == 'subsidy':
         keyboard = []
         for label, code in PASSENGER_TYPES:
@@ -372,7 +361,6 @@ async def type_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Выберите категорию пассажира:", reply_markup=InlineKeyboardMarkup(keyboard))
         return PASSENGER_TYPE
     else:
-        # Для Aviasales переходим к городам
         return await show_cities(update, context)
 
 async def passenger_type_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -383,7 +371,6 @@ async def passenger_type_chosen(update: Update, context: ContextTypes.DEFAULT_TY
     return await show_cities(update, context)
 
 async def show_cities(update, context):
-    """Показывает список городов для выбора вылета."""
     keyboard = []
     for city, code in CITIES.items():
         keyboard.append([InlineKeyboardButton(f"{city} ({code})", callback_data=f"origin_{code}")])
@@ -447,7 +434,6 @@ async def dest_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return CITY_INPUT
     else:
         context.user_data['dest'] = data.split("_")[1]
-        # Спрашиваем, нужна ли обратная дата
         keyboard = [
             [InlineKeyboardButton("✅ Да, туда и обратно", callback_data="round_yes")],
             [InlineKeyboardButton("➡️ Только туда", callback_data="round_no")],
@@ -455,6 +441,25 @@ async def dest_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         await query.edit_message_text("Вам нужен билет туда и обратно?", reply_markup=InlineKeyboardMarkup(keyboard))
         return ROUND_TRIP
+
+async def dest_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка ручного ввода города назначения."""
+    text = update.message.text.strip().upper()
+    if text in ("SVO", "DME", "VKO"):
+        text = "MOW"
+    for city, code in CITIES.items():
+        if text == code or text == city.upper():
+            context.user_data['dest'] = code
+            break
+    else:
+        context.user_data['dest'] = text
+    keyboard = [
+        [InlineKeyboardButton("✅ Да, туда и обратно", callback_data="round_yes")],
+        [InlineKeyboardButton("➡️ Только туда", callback_data="round_no")],
+        [InlineKeyboardButton("↩️ Назад", callback_data="back")]
+    ]
+    await update.message.reply_text("Вам нужен билет туда и обратно?", reply_markup=InlineKeyboardMarkup(keyboard))
+    return ROUND_TRIP
 
 async def round_trip_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -464,7 +469,6 @@ async def round_trip_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['round_trip'] = 1
     else:
         context.user_data['round_trip'] = 0
-    # Теперь выбираем режим дат: конкретная дата или любая
     keyboard = [
         [InlineKeyboardButton("📅 Конкретная дата", callback_data="date_mode_specific")],
         [InlineKeyboardButton("🗓️ Любая дата (самая дешёвая)", callback_data="date_mode_any")],
@@ -476,7 +480,7 @@ async def round_trip_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def date_mode_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    mode = query.data.split("_")[2]  # "specific" или "any"
+    mode = query.data.split("_")[2]
     context.user_data['date_mode'] = mode
     if mode == "specific":
         now = datetime.now()
@@ -485,11 +489,10 @@ async def date_mode_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=build_calendar(now.year, now.month, "from")
         )
         return DATE_FROM
-    else:  # any
+    else:
         context.user_data['date_from'] = None
         context.user_data['date_to'] = None
         context.user_data['any_date'] = 1
-        # Переходим к цене
         keyboard = [
             [InlineKeyboardButton("5000", callback_data="price_5000"),
              InlineKeyboardButton("10000", callback_data="price_10000"),
@@ -696,7 +699,6 @@ async def airline_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if airline == "Любая":
         airline = None
     context.user_data['airline'] = airline
-    # Завершаем создание подписки
     return await finish(update, context)
 
 async def finish(update, context):
@@ -721,17 +723,14 @@ async def finish(update, context):
             await update.callback_query.edit_message_text("Ошибка: не указана дата.")
             return ConversationHandler.END
         if round_trip == 1 and not date_to:
-            date_to = date_from  # если только туда, то дата возврата = дата вылета
+            date_to = date_from
 
-    # Сохраняем подписку
     add_sub(user_id, typ, origin, dest, date_from, date_to, max_price, airline, passenger_type, round_trip, any_date)
 
-    # Получаем ID новой подписки
     subs = get_subs(active_only=False)
     user_subs = [s for s in subs if s[1] == user_id]
     sub_id = user_subs[-1][0] if user_subs else None
 
-    # Очищаем данные
     context.user_data.clear()
 
     if update.callback_query:
@@ -748,7 +747,6 @@ async def finish(update, context):
 
 async def immediate_check(update, context, sub_id, user_id, typ, origin, dest, date_from, date_to, max_price, airline, passenger_type, any_date):
     if any_date:
-        # Ищем на любую дату в ближайшие 30 дней
         date_list = generate_date_range_for_any_date(max_days=30)
     else:
         if date_from:
@@ -765,9 +763,7 @@ async def immediate_check(update, context, sub_id, user_id, typ, origin, dest, d
         tickets = fetch_aeroflot_subsidy(origin, dest, date_list, passenger_type)
 
     if tickets:
-        # Сортируем по цене и показываем самый дешёвый
         tickets.sort(key=lambda x: x['price'])
-        # Покажем до 5 билетов
         for t in tickets[:5]:
             keyboard = [[InlineKeyboardButton("✈️ Купить", url=t["link"])]]
             await context.bot.send_message(
@@ -902,7 +898,6 @@ async def edit_sub_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await list_subs(update, context)
         return ConversationHandler.END
 
-# === Обработка текстового ввода для редактирования ===
 async def handle_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     user_id = update.effective_user.id
@@ -972,8 +967,9 @@ async def handle_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         update_sub(sub_id, user_id, origin=origin, dest=dest)
         await update.message.reply_text(f"✅ Направление обновлено: {origin} → {dest}.")
     elif field == 'date_mode':
-        # Обработка через колбэк, здесь не будет
-        pass
+        # Не должно сюда попадать, но на всякий случай
+        await update.message.reply_text("Используйте кнопки для изменения режима дат.")
+        return
     else:
         await update.message.reply_text("Неизвестное поле.")
         return
@@ -990,8 +986,7 @@ async def edit_date_mode_callback(update: Update, context: ContextTypes.DEFAULT_
         await query.edit_message_text("Ошибка.")
         return
     if data == "edit_date_specific":
-        # Запросить конкретную дату
-        context.user_data['edit_field'] = 'dates'  # переиспользуем обработку дат
+        context.user_data['edit_field'] = 'dates'
         await query.edit_message_text("Введите конкретную дату в формате ДД.ММ.ГГГГ (или диапазон):")
         return
     elif data == "edit_date_any":
@@ -1025,7 +1020,6 @@ async def show_all_found(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = "📭 Нет найденных билетов ни для одной подписки."
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="back")]]))
 
-# === Прочие команды ===
 async def pause_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -1062,19 +1056,18 @@ async def back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     await query.edit_message_text("✈️ Главное меню:", reply_markup=InlineKeyboardMarkup(keyboard))
 
-# === Периодическая проверка (с расширением ±3 дня) ===
+# === Периодическая проверка ===
 def check_all(context: ContextTypes.DEFAULT_TYPE):
     subs = get_subs(active_only=True)
     for sub in subs:
         sub_id, user_id, typ, origin, dest, date_from, date_to, max_price, airline, passenger, active, round_trip, any_date = sub
         if active != 1:
             continue
-        # Генерируем список дат для поиска
         if any_date:
             date_list = generate_date_range_for_any_date(max_days=30)
         else:
             if date_from:
-                date_list = expand_dates(date_from, date_to, days=3)  # расширение для мониторинга
+                date_list = expand_dates(date_from, date_to, days=3)
             else:
                 continue
         if not date_list:
