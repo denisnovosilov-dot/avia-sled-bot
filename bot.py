@@ -5,6 +5,7 @@ import os
 import sys
 import logging
 import sqlite3
+import re
 from datetime import datetime, timedelta
 from threading import Lock
 from dotenv import load_dotenv
@@ -76,6 +77,7 @@ def get_subs(active_only=True):
         q = "SELECT id, user_id, type, origin, dest, date_from, date_to, max_price, category, airline FROM subs"
         if active_only:
             q += " WHERE active=1"
+        c.execute(q)
         rows = c.fetchall()
         conn.close()
         return rows
@@ -176,7 +178,7 @@ def fetch_aviasales(origin, dest, d_from, d_to):
         logger.error(f"Ошибка Aviasales: {e}")
     return None
 
-# === Календарь (без багов) ===
+# === Календарь (исправленный) ===
 def build_calendar(year, month, prefix):
     now = datetime.now()
     first_day = datetime(year, month, 1)
@@ -208,7 +210,6 @@ def build_calendar(year, month, prefix):
             row = []
         day += 1
     if row:
-        # Добиваем пустыми кнопками, чтобы ряд был полным
         while len(row) < 7:
             row.append(InlineKeyboardButton(" ", callback_data="ignore"))
         keyboard.append(row)
@@ -312,7 +313,7 @@ async def dest_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['dest'] = data.split("_")[1]
         now = datetime.now()
         await query.edit_message_text(
-            "📅 Выберите дату вылета (кликните по дню):",
+            "📅 Выберите дату вылета (кликните по дню) или введите в формате ДД.ММ.ГГГГ (или ДД.ММ.ГГГГ-ДД.ММ.ГГГГ):",
             reply_markup=build_calendar(now.year, now.month, "from")
         )
         return DATE_FROM
@@ -327,7 +328,7 @@ async def dest_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['dest'] = text
     now = datetime.now()
     await update.message.reply_text(
-        "📅 Выберите дату вылета:",
+        "📅 Выберите дату вылета (кликните по дню) или введите в формате ДД.ММ.ГГГГ (или ДД.ММ.ГГГГ-ДД.ММ.ГГГГ):",
         reply_markup=build_calendar(now.year, now.month, "from")
     )
     return DATE_FROM
@@ -337,50 +338,14 @@ async def calendar_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = query.data
     parts = data.split("_")
-    prefix = parts[0]
+    prefix = parts[0]  # "from", "to", или "ignore"
+
     if prefix == "ignore":
         return
-    if prefix == "from":
-        # выбрана дата вылета
-        date_str = parts[1]
-        if datetime.strptime(date_str, "%Y-%m-%d").date() < datetime.now().date():
-            await query.edit_message_text("❌ Нельзя выбрать прошлое.")
-            return
-        context.user_data['date_from'] = date_str
-        # теперь календарь для даты возврата
-        await query.edit_message_text(
-            f"✅ Вылет: {date_str}\nТеперь выберите дату возврата (или ту же):",
-            reply_markup=build_calendar(
-                datetime.strptime(date_str, "%Y-%m-%d").year,
-                datetime.strptime(date_str, "%Y-%m-%d").month,
-                "to"
-            )
-        )
-        return DATE_TO
-    elif prefix == "to":
-        date_str = parts[1]
-        if datetime.strptime(date_str, "%Y-%m-%d").date() < datetime.now().date():
-            await query.edit_message_text("❌ Нельзя выбрать прошлое.")
-            return
-        context.user_data['date_to'] = date_str
-        # Переход к цене или завершению
-        if context.user_data.get('type') == 'aviasales':
-            keyboard = [
-                [InlineKeyboardButton("5000", callback_data="price_5000"),
-                 InlineKeyboardButton("10000", callback_data="price_10000"),
-                 InlineKeyboardButton("15000", callback_data="price_15000"),
-                 InlineKeyboardButton("20000", callback_data="price_20000")],
-                [InlineKeyboardButton("✏️ Своя", callback_data="price_custom")],
-                [InlineKeyboardButton("↩️ Назад", callback_data="back")]
-            ]
-            await query.edit_message_text("💰 Укажите максимальную цену:", reply_markup=InlineKeyboardMarkup(keyboard))
-            return PRICE
-        else:
-            # Субсидия
-            return await finish(update, context)
-    else:
-        # Навигация
-        action = parts[1]
+
+    # Обработка навигации (стрелки)
+    if len(parts) >= 4 and parts[1] in ("prev", "next"):
+        action = parts[1]   # prev или next
         year = int(parts[2])
         month = int(parts[3])
         if action == "prev":
@@ -395,19 +360,151 @@ async def calendar_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 month = 1
             else:
                 month += 1
-        # Определяем, какой префикс у текущего календаря
+        # Определяем, какой календарь показываем (from или to) – сохраняем в context
         current_prefix = context.user_data.get('calendar_prefix', 'from')
         await query.edit_message_reply_markup(
             reply_markup=build_calendar(year, month, current_prefix)
         )
         return
 
+    # Если дошли сюда, значит выбрана дата (формат: "from_2026-07-15" или "to_2026-07-15")
+    if len(parts) != 2:
+        await query.edit_message_text("Ошибка: неверный формат даты. Попробуйте снова.")
+        return
+    date_str = parts[1]
+    try:
+        selected_date = datetime.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        await query.edit_message_text("Ошибка формата даты. Попробуйте снова.")
+        return
+
+    if selected_date.date() < datetime.now().date():
+        await query.edit_message_text("❌ Нельзя выбрать прошедшую дату.")
+        return
+
+    if prefix == "from":
+        context.user_data['date_from'] = date_str
+        # переходим к выбору даты возврата
+        await query.edit_message_text(
+            f"✅ Вылет: {date_str}\nТеперь выберите дату возврата (или ту же) – можно также ввести текстом.",
+            reply_markup=build_calendar(selected_date.year, selected_date.month, "to")
+        )
+        context.user_data['calendar_prefix'] = "to"
+        return DATE_TO
+    elif prefix == "to":
+        context.user_data['date_to'] = date_str
+        # Переход к следующему шагу (цена или завершение)
+        if context.user_data.get('type') == 'aviasales':
+            keyboard = [
+                [InlineKeyboardButton("5000", callback_data="price_5000"),
+                 InlineKeyboardButton("10000", callback_data="price_10000"),
+                 InlineKeyboardButton("15000", callback_data="price_15000"),
+                 InlineKeyboardButton("20000", callback_data="price_20000")],
+                [InlineKeyboardButton("✏️ Своя", callback_data="price_custom")],
+                [InlineKeyboardButton("↩️ Назад", callback_data="back")]
+            ]
+            await query.edit_message_text("💰 Укажите максимальную цену:", reply_markup=InlineKeyboardMarkup(keyboard))
+            return PRICE
+        else:
+            return await finish(update, context)
+    else:
+        await query.edit_message_text("Неизвестная команда.")
+        return
+
+# Обработка текстового ввода дат
+async def handle_date_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    # Проверяем формат ДД.ММ.ГГГГ или ДД.ММ.ГГГГ-ДД.ММ.ГГГГ
+    pattern = r'^(\d{2})\.(\d{2})\.(\d{4})(?:-(\d{2})\.(\d{2})\.(\d{4}))?$'
+    match = re.match(pattern, text)
+    if not match:
+        await update.message.reply_text("❌ Неверный формат. Используйте ДД.ММ.ГГГГ или ДД.ММ.ГГГГ-ДД.ММ.ГГГГ.")
+        return DATE_FROM
+    if match.group(4):  # диапазон
+        d1 = datetime(int(match.group(3)), int(match.group(2)), int(match.group(1)))
+        d2 = datetime(int(match.group(6)), int(match.group(5)), int(match.group(4)))
+        if d1.date() < datetime.now().date() or d2.date() < datetime.now().date():
+            await update.message.reply_text("❌ Даты не могут быть в прошлом.")
+            return DATE_FROM
+        if d2 < d1:
+            await update.message.reply_text("❌ Дата возврата не может быть раньше даты вылета.")
+            return DATE_FROM
+        date_from = d1.strftime("%Y-%m-%d")
+        date_to = d2.strftime("%Y-%m-%d")
+        context.user_data['date_from'] = date_from
+        context.user_data['date_to'] = date_to
+        # Переходим к цене или завершению
+        if context.user_data.get('type') == 'aviasales':
+            await update.message.reply_text("💰 Укажите максимальную цену (выберите или введите):")
+            # Показываем inline клавиатуру с ценами
+            keyboard = [
+                [InlineKeyboardButton("5000", callback_data="price_5000"),
+                 InlineKeyboardButton("10000", callback_data="price_10000"),
+                 InlineKeyboardButton("15000", callback_data="price_15000"),
+                 InlineKeyboardButton("20000", callback_data="price_20000")],
+                [InlineKeyboardButton("✏️ Своя", callback_data="price_custom")],
+                [InlineKeyboardButton("↩️ Назад", callback_data="back")]
+            ]
+            await update.message.reply_text("Выберите цену:", reply_markup=InlineKeyboardMarkup(keyboard))
+            return PRICE
+        else:
+            return await finish(update, context)
+    else:  # одна дата
+        day = int(match.group(1))
+        month = int(match.group(2))
+        year = int(match.group(3))
+        selected = datetime(year, month, day)
+        if selected.date() < datetime.now().date():
+            await update.message.reply_text("❌ Дата не может быть в прошлом.")
+            return DATE_FROM
+        date_str = selected.strftime("%Y-%m-%d")
+        context.user_data['date_from'] = date_str
+        # Теперь просим ввести дату возврата
+        await update.message.reply_text(
+            f"✅ Вылет: {date_str}\nТеперь введите дату возврата (или ту же) в формате ДД.ММ.ГГГГ:",
+            reply_markup=build_calendar(selected.year, selected.month, "to")
+        )
+        context.user_data['calendar_prefix'] = "to"
+        return DATE_TO
+
+# Аналогично для даты возврата (если пользователь вводит текстом на шаге DATE_TO)
+async def handle_date_to_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    pattern = r'^(\d{2})\.(\d{2})\.(\d{4})$'
+    match = re.match(pattern, text)
+    if not match:
+        await update.message.reply_text("❌ Неверный формат. Используйте ДД.ММ.ГГГГ.")
+        return DATE_TO
+    day = int(match.group(1))
+    month = int(match.group(2))
+    year = int(match.group(3))
+    selected = datetime(year, month, day)
+    if selected.date() < datetime.now().date():
+        await update.message.reply_text("❌ Дата не может быть в прошлом.")
+        return DATE_TO
+    date_to = selected.strftime("%Y-%m-%d")
+    context.user_data['date_to'] = date_to
+    if context.user_data.get('type') == 'aviasales':
+        await update.message.reply_text("💰 Укажите максимальную цену (выберите или введите):")
+        keyboard = [
+            [InlineKeyboardButton("5000", callback_data="price_5000"),
+             InlineKeyboardButton("10000", callback_data="price_10000"),
+             InlineKeyboardButton("15000", callback_data="price_15000"),
+             InlineKeyboardButton("20000", callback_data="price_20000")],
+            [InlineKeyboardButton("✏️ Своя", callback_data="price_custom")],
+            [InlineKeyboardButton("↩️ Назад", callback_data="back")]
+        ]
+        await update.message.reply_text("Выберите цену:", reply_markup=InlineKeyboardMarkup(keyboard))
+        return PRICE
+    else:
+        return await finish(update, context)
+
 async def price_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
     if data == "price_custom":
-        await query.edit_message_text("Введите цену числом:")
+        await query.edit_message_text("Введите цену числом (только цифры):")
         return PRICE
     else:
         context.user_data['max_price'] = int(data.split("_")[1])
@@ -568,7 +665,6 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    # Просто показываем главное меню
     keyboard = [
         [InlineKeyboardButton("🔍 Новый поиск", callback_data="new")],
         [InlineKeyboardButton("📋 Мои подписки", callback_data="list")],
@@ -615,18 +711,23 @@ def main():
             TYPE: [CallbackQueryHandler(type_chosen, pattern="^type_")],
             ORIGIN: [CallbackQueryHandler(origin_chosen, pattern="^origin_"), MessageHandler(filters.TEXT & ~filters.COMMAND, origin_manual)],
             DEST: [CallbackQueryHandler(dest_chosen, pattern="^dest_"), MessageHandler(filters.TEXT & ~filters.COMMAND, dest_manual)],
-            DATE_FROM: [CallbackQueryHandler(calendar_handler, pattern="^(from|from_prev|from_next|ignore)")],
-            DATE_TO: [CallbackQueryHandler(calendar_handler, pattern="^(to|to_prev|to_next|ignore)")],
+            DATE_FROM: [
+                CallbackQueryHandler(calendar_handler, pattern="^(from|from_prev|from_next|ignore)"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_date_text)
+            ],
+            DATE_TO: [
+                CallbackQueryHandler(calendar_handler, pattern="^(to|to_prev|to_next|ignore)"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_date_to_text)
+            ],
             PRICE: [CallbackQueryHandler(price_chosen, pattern="^price_"), MessageHandler(filters.TEXT & ~filters.COMMAND, price_manual)],
             AIRLINE: [CallbackQueryHandler(airline_chosen, pattern="^airline_")],
-            CITY_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, origin_manual)],  # общий, но будет работать
+            CITY_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, origin_manual)],
         },
         fallbacks=[CallbackQueryHandler(back, pattern="^back$")],
         per_user=True
     )
     app.add_handler(conv)
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(start, pattern="^back$"))  # если из главного меню
     app.add_handler(CallbackQueryHandler(list_subs, pattern="^list$"))
     app.add_handler(CallbackQueryHandler(manage_sub, pattern="^(pause|resume|delete)_"))
     app.add_handler(CallbackQueryHandler(pause_all, pattern="^pause_all$"))
