@@ -49,14 +49,11 @@ def init_db():
         c.execute('''CREATE TABLE IF NOT EXISTS subs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
-            type TEXT,
             origin TEXT,
             dest TEXT,
             date_from TEXT,
             date_to TEXT,
             max_price INTEGER,
-            category TEXT,
-            airline TEXT,
             active INTEGER DEFAULT 1,
             round_trip INTEGER DEFAULT 1
         )''')
@@ -75,7 +72,7 @@ def get_subs(active_only=True):
     with lock:
         conn = sqlite3.connect(DB_NAME)
         c = conn.cursor()
-        q = "SELECT id, user_id, type, origin, dest, date_from, date_to, max_price, category, airline, active, round_trip FROM subs"
+        q = "SELECT id, user_id, origin, dest, date_from, date_to, max_price, active, round_trip FROM subs"
         if active_only:
             q += " WHERE active=1"
         c.execute(q)
@@ -83,14 +80,13 @@ def get_subs(active_only=True):
         conn.close()
         return rows
 
-def add_sub(user_id, typ, origin, dest, d_from, d_to, max_price=None, category='SRC', airline=None, round_trip=1):
+def add_sub(user_id, origin, dest, d_from, d_to, max_price=None, round_trip=1):
     with lock:
         conn = sqlite3.connect(DB_NAME)
         c = conn.cursor()
-        c.execute('''INSERT INTO subs 
-            (user_id, type, origin, dest, date_from, date_to, max_price, category, airline, active, round_trip)
-            VALUES (?,?,?,?,?,?,?,?,?,1,?)''',
-            (user_id, typ, origin, dest, d_from, d_to, max_price, category, airline, round_trip))
+        c.execute('''INSERT INTO subs (user_id, origin, dest, date_from, date_to, max_price, active, round_trip)
+                     VALUES (?,?,?,?,?,?,1,?)''',
+                  (user_id, origin, dest, d_from, d_to, max_price, round_trip))
         conn.commit()
         conn.close()
 
@@ -128,7 +124,7 @@ def get_found(sub_id):
         conn.close()
         return rows
 
-# === Города и авиакомпании ===
+# === Города ===
 CITIES = {
     "Москва": "MOW", "Санкт-Петербург": "LED", "Владивосток": "VVO",
     "Сочи": "AER", "Екатеринбург": "SVX", "Новосибирск": "OVB",
@@ -136,50 +132,8 @@ CITIES = {
     "Южно-Сахалинск": "UUS", "Калининград": "KGD", "Казань": "KZN",
     "Самара": "KUF", "Ростов-на-Дону": "ROV"
 }
-AIRLINES = ["Аэрофлот", "S7", "Победа", "Уральские авиалинии", "Utair", "Nordwind", "Икар", "Любая"]
 
-# === Умный поиск с запасом ±3 дня ===
-def expand_dates(date_from, date_to=None, days=3):
-    start = datetime.strptime(date_from, "%Y-%m-%d")
-    if date_to:
-        end = datetime.strptime(date_to, "%Y-%m-%d")
-    else:
-        end = start
-    start_exp = start - timedelta(days=days)
-    end_exp = end + timedelta(days=days)
-    dates = []
-    cur = start_exp
-    while cur <= end_exp:
-        dates.append(cur.strftime("%Y-%m-%d"))
-        cur += timedelta(days=1)
-    return dates
-
-# === Функции поиска ===
-def fetch_subsidy(origin, dest, date_list, category='SRC'):
-    results = []
-    url = "https://www.aeroflot.ru/api/ru-RU/search/flights"
-    headers = {"User-Agent": "Mozilla/5.0", "Content-Type": "application/json"}
-    for date_str in date_list:
-        payload = {
-            "origin": origin, "destination": dest,
-            "departureDate": date_str,
-            "adultCount": 1, "childCount": 0, "infantCount": 0,
-            "cabin": "Y", "fareType": category
-        }
-        try:
-            resp = requests.post(url, json=payload, headers=headers, timeout=10)
-            if resp.status_code == 200:
-                data = resp.json()
-                for seg in data.get("segments", []):
-                    if seg.get("fareType") == "SUB" or seg.get("isSubsidized"):
-                        price = seg.get("price", {}).get("amount", 0)
-                        link = f"https://www.aeroflot.ru/ru-ru/pbsa/search?origin={origin}&destination={dest}&date={date_str}"
-                        results.append({"date": date_str, "price": int(price) if price else 0, "link": link})
-                        break
-        except Exception as e:
-            logger.error(f"Ошибка Аэрофлота: {e}")
-    return results
-
+# === Функция поиска через Aviasales ===
 def fetch_aviasales(origin, dest, date_list):
     results = []
     url = "https://api.travelpayouts.com/v1/prices/calendar"
@@ -195,16 +149,34 @@ def fetch_aviasales(origin, dest, date_list):
             resp = requests.get(url, params=params, timeout=10)
             if resp.status_code == 200:
                 data = resp.json()
-                prices = [d["price"] for d in data.get("data", []) if "price" in d]
-                if prices:
-                    min_price = min(prices)
-                    link = f"https://www.aviasales.ru/search/{origin}{dest}{date_str}"
-                    results.append({"date": date_str, "price": min_price, "link": link})
+                if data.get("success") and data.get("data"):
+                    for d in data["data"]:
+                        price = d.get("price")
+                        if price is not None:
+                            link = f"https://www.aviasales.ru/search/{origin}{dest}{date_str}"
+                            results.append({"date": date_str, "price": price, "link": link})
+                            break  # берём первую найденную цену для этой даты
         except Exception as e:
             logger.error(f"Ошибка Aviasales: {e}")
     return results
 
-# === Календарь (исправленный) ===
+# === Умный поиск с расширением дат ±3 дня ===
+def expand_dates(date_from, date_to=None, days=3):
+    start = datetime.strptime(date_from, "%Y-%m-%d")
+    if date_to:
+        end = datetime.strptime(date_to, "%Y-%m-%d")
+    else:
+        end = start
+    start_exp = start - timedelta(days=days)
+    end_exp = end + timedelta(days=days)
+    dates = []
+    cur = start_exp
+    while cur <= end_exp:
+        dates.append(cur.strftime("%Y-%m-%d"))
+        cur += timedelta(days=1)
+    return dates
+
+# === Календарь (работает) ===
 def build_calendar(year, month, prefix):
     now = datetime.now()
     first_day = datetime(year, month, 1)
@@ -265,7 +237,6 @@ async def new_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     keyboard = [
-        [InlineKeyboardButton("🛫 Субсидированный (Аэрофлот)", callback_data="type_subsidy")],
         [InlineKeyboardButton("💰 Дешёвые (Aviasales)", callback_data="type_aviasales")],
         [InlineKeyboardButton("↩️ Назад", callback_data="back")]
     ]
@@ -275,8 +246,7 @@ async def new_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def type_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    typ = query.data.split("_")[1]
-    context.user_data['type'] = typ
+    # Только Aviasales
     keyboard = []
     for city, code in CITIES.items():
         keyboard.append([InlineKeyboardButton(f"{city} ({code})", callback_data=f"origin_{code}")])
@@ -298,6 +268,9 @@ async def origin_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def origin_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip().upper()
+    # Маппинг для Москвы
+    if text in ("SVO", "DME", "VKO"):
+        text = "MOW"
     for city, code in CITIES.items():
         if text == code or text == city.upper():
             context.user_data['origin'] = code
@@ -365,6 +338,8 @@ async def round_trip_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def dest_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip().upper()
+    if text in ("SVO", "DME", "VKO"):
+        text = "MOW"
     for city, code in CITIES.items():
         if text == code or text == city.upper():
             context.user_data['dest'] = code
@@ -436,23 +411,6 @@ async def calendar_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return DATE_TO
         else:
             context.user_data['date_to'] = None
-            if context.user_data.get('type') == 'aviasales':
-                keyboard = [
-                    [InlineKeyboardButton("5000", callback_data="price_5000"),
-                     InlineKeyboardButton("10000", callback_data="price_10000"),
-                     InlineKeyboardButton("15000", callback_data="price_15000"),
-                     InlineKeyboardButton("20000", callback_data="price_20000")],
-                    [InlineKeyboardButton("✏️ Своя", callback_data="price_custom")],
-                    [InlineKeyboardButton("⏩ Пропустить цену", callback_data="price_skip")],
-                    [InlineKeyboardButton("↩️ Назад", callback_data="back")]
-                ]
-                await query.edit_message_text("💰 Укажите максимальную цену (или пропустите):", reply_markup=InlineKeyboardMarkup(keyboard))
-                return PRICE
-            else:
-                return await finish(update, context)
-    elif prefix == "to":
-        context.user_data['date_to'] = date_str
-        if context.user_data.get('type') == 'aviasales':
             keyboard = [
                 [InlineKeyboardButton("5000", callback_data="price_5000"),
                  InlineKeyboardButton("10000", callback_data="price_10000"),
@@ -464,8 +422,19 @@ async def calendar_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]
             await query.edit_message_text("💰 Укажите максимальную цену (или пропустите):", reply_markup=InlineKeyboardMarkup(keyboard))
             return PRICE
-        else:
-            return await finish(update, context)
+    elif prefix == "to":
+        context.user_data['date_to'] = date_str
+        keyboard = [
+            [InlineKeyboardButton("5000", callback_data="price_5000"),
+             InlineKeyboardButton("10000", callback_data="price_10000"),
+             InlineKeyboardButton("15000", callback_data="price_15000"),
+             InlineKeyboardButton("20000", callback_data="price_20000")],
+            [InlineKeyboardButton("✏️ Своя", callback_data="price_custom")],
+            [InlineKeyboardButton("⏩ Пропустить цену", callback_data="price_skip")],
+            [InlineKeyboardButton("↩️ Назад", callback_data="back")]
+        ]
+        await query.edit_message_text("💰 Укажите максимальную цену (или пропустите):", reply_markup=InlineKeyboardMarkup(keyboard))
+        return PRICE
     else:
         await query.edit_message_text("Неизвестная команда.")
         return
@@ -493,20 +462,17 @@ async def handle_date_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return DATE_TO
     else:
         context.user_data['date_to'] = None
-        if context.user_data.get('type') == 'aviasales':
-            keyboard = [
-                [InlineKeyboardButton("5000", callback_data="price_5000"),
-                 InlineKeyboardButton("10000", callback_data="price_10000"),
-                 InlineKeyboardButton("15000", callback_data="price_15000"),
-                 InlineKeyboardButton("20000", callback_data="price_20000")],
-                [InlineKeyboardButton("✏️ Своя", callback_data="price_custom")],
-                [InlineKeyboardButton("⏩ Пропустить цену", callback_data="price_skip")],
-                [InlineKeyboardButton("↩️ Назад", callback_data="back")]
-            ]
-            await update.message.reply_text("💰 Укажите максимальную цену (или пропустите):", reply_markup=InlineKeyboardMarkup(keyboard))
-            return PRICE
-        else:
-            return await finish(update, context)
+        keyboard = [
+            [InlineKeyboardButton("5000", callback_data="price_5000"),
+             InlineKeyboardButton("10000", callback_data="price_10000"),
+             InlineKeyboardButton("15000", callback_data="price_15000"),
+             InlineKeyboardButton("20000", callback_data="price_20000")],
+            [InlineKeyboardButton("✏️ Своя", callback_data="price_custom")],
+            [InlineKeyboardButton("⏩ Пропустить цену", callback_data="price_skip")],
+            [InlineKeyboardButton("↩️ Назад", callback_data="back")]
+        ]
+        await update.message.reply_text("💰 Укажите максимальную цену (или пропустите):", reply_markup=InlineKeyboardMarkup(keyboard))
+        return PRICE
 
 async def handle_date_to_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
@@ -522,20 +488,17 @@ async def handle_date_to_text(update: Update, context: ContextTypes.DEFAULT_TYPE
         return DATE_TO
     date_str = selected.strftime("%Y-%m-%d")
     context.user_data['date_to'] = date_str
-    if context.user_data.get('type') == 'aviasales':
-        keyboard = [
-            [InlineKeyboardButton("5000", callback_data="price_5000"),
-             InlineKeyboardButton("10000", callback_data="price_10000"),
-             InlineKeyboardButton("15000", callback_data="price_15000"),
-             InlineKeyboardButton("20000", callback_data="price_20000")],
-            [InlineKeyboardButton("✏️ Своя", callback_data="price_custom")],
-            [InlineKeyboardButton("⏩ Пропустить цену", callback_data="price_skip")],
-            [InlineKeyboardButton("↩️ Назад", callback_data="back")]
-        ]
-        await update.message.reply_text("💰 Укажите максимальную цену (или пропустите):", reply_markup=InlineKeyboardMarkup(keyboard))
-        return PRICE
-    else:
-        return await finish(update, context)
+    keyboard = [
+        [InlineKeyboardButton("5000", callback_data="price_5000"),
+         InlineKeyboardButton("10000", callback_data="price_10000"),
+         InlineKeyboardButton("15000", callback_data="price_15000"),
+         InlineKeyboardButton("20000", callback_data="price_20000")],
+        [InlineKeyboardButton("✏️ Своя", callback_data="price_custom")],
+        [InlineKeyboardButton("⏩ Пропустить цену", callback_data="price_skip")],
+        [InlineKeyboardButton("↩️ Назад", callback_data="back")]
+    ]
+    await update.message.reply_text("💰 Укажите максимальную цену (или пропустите):", reply_markup=InlineKeyboardMarkup(keyboard))
+    return PRICE
 
 async def price_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -546,61 +509,32 @@ async def price_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return PRICE
     elif data == "price_skip":
         context.user_data['max_price'] = None
-        return await show_airlines(update, context)
+        return await finish(update, context)
     else:
         context.user_data['max_price'] = int(data.split("_")[1])
-        return await show_airlines(update, context)
+        return await finish(update, context)
 
 async def price_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         price = int(update.message.text.strip())
         context.user_data['max_price'] = price
         await update.message.reply_text(f"✅ Цена {price} ₽ сохранена.")
-        return await show_airlines(update, context)
+        return await finish(update, context)
     except:
         await update.message.reply_text("❌ Введите число.")
         return PRICE
 
-async def show_airlines(update, context):
-    keyboard = []
-    for airline in AIRLINES:
-        keyboard.append([InlineKeyboardButton(airline, callback_data=f"airline_{airline}")])
-    keyboard.append([InlineKeyboardButton("↩️ Назад", callback_data="back")])
-    if update.callback_query:
-        await update.callback_query.edit_message_text(
-            "✈️ Выберите авиакомпанию (или 'Любая'):",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-    else:
-        await update.message.reply_text(
-            "✈️ Выберите авиакомпанию:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-    return AIRLINE
-
-async def airline_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    airline = query.data.split("_")[1]
-    if airline == "Любая":
-        airline = None
-    context.user_data['airline'] = airline
-    return await finish(update, context)
-
 async def finish(update, context):
     user_id = update.effective_user.id
-    typ = context.user_data['type']
     origin = context.user_data['origin']
     dest = context.user_data['dest']
     d_from = context.user_data['date_from']
     d_to = context.user_data.get('date_to')
     max_price = context.user_data.get('max_price')
-    category = 'SRC' if typ == 'subsidy' else None
-    airline = context.user_data.get('airline')
     round_trip = 1 if context.user_data.get('round_trip') == 1 else 0
     if not d_to and round_trip == 1:
         d_to = d_from
-    add_sub(user_id, typ, origin, dest, d_from, d_to, max_price, category, airline, round_trip)
+    add_sub(user_id, origin, dest, d_from, d_to, max_price, round_trip)
     subs = get_subs(active_only=False)
     user_subs = [s for s in subs if s[1] == user_id]
     sub_id = user_subs[-1][0] if user_subs else None
@@ -612,39 +546,25 @@ async def finish(update, context):
     else:
         await update.message.reply_text("✅ Подписка добавлена!")
     if sub_id:
-        await immediate_check(update, context, sub_id, user_id, typ, origin, dest, d_from, d_to, max_price, category)
+        await immediate_check(update, context, sub_id, user_id, origin, dest, d_from, d_to, max_price)
     return ConversationHandler.END
 
-async def immediate_check(update, context, sub_id, user_id, typ, origin, dest, d_from, d_to, max_price, category):
+async def immediate_check(update, context, sub_id, user_id, origin, dest, d_from, d_to, max_price):
     date_list = expand_dates(d_from, d_to, days=3)
-    if typ == 'subsidy':
-        tickets = fetch_subsidy(origin, dest, date_list, category)
-        if tickets:
-            for t in tickets:
-                keyboard = [[InlineKeyboardButton("✈️ Купить", url=t["link"])]]
-                await context.bot.send_message(
-                    chat_id=user_id,
-                    text=f"🎫 СУБСИДИРОВАННЫЙ БИЛЕТ ДОСТУПЕН!\n📍 {origin}→{dest}\n📅 {t['date']}\n💵 {t['price']} ₽",
-                    reply_markup=InlineKeyboardMarkup(keyboard)
-                )
-                add_found(sub_id, t['date'], t['price'], t['link'])
-        else:
-            await context.bot.send_message(chat_id=user_id, text="🔍 Пока билетов нет. Будем отслеживать с запасом ±3 дня.")
-    else:
-        tickets = fetch_aviasales(origin, dest, date_list)
-        found = False
-        for t in tickets:
-            if max_price is None or t['price'] <= max_price:
-                keyboard = [[InlineKeyboardButton("✈️ Купить", url=t["link"])]]
-                await context.bot.send_message(
-                    chat_id=user_id,
-                    text=f"💰 БИЛЕТ ПО ВАШЕЙ ЦЕНЕ!\n📍 {origin}→{dest}\n📅 {t['date']}\n💵 {t['price']} ₽" + (f" (порог {max_price} ₽)" if max_price else ""),
-                    reply_markup=InlineKeyboardMarkup(keyboard)
-                )
-                add_found(sub_id, t['date'], t['price'], t['link'])
-                found = True
-        if not found:
-            await context.bot.send_message(chat_id=user_id, text="🔍 Пока билетов по вашей цене нет. Будем отслеживать с запасом ±3 дня.")
+    tickets = fetch_aviasales(origin, dest, date_list)
+    found = False
+    for t in tickets:
+        if max_price is None or t['price'] <= max_price:
+            keyboard = [[InlineKeyboardButton("✈️ Купить", url=t["link"])]]
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"💰 БИЛЕТ ПО ВАШЕЙ ЦЕНЕ!\n📍 {origin}→{dest}\n📅 {t['date']}\n💵 {t['price']} ₽" + (f" (порог {max_price} ₽)" if max_price else ""),
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            add_found(sub_id, t['date'], t['price'], t['link'])
+            found = True
+    if not found:
+        await context.bot.send_message(chat_id=user_id, text="🔍 Пока билетов по вашей цене нет. Будем отслеживать с запасом ±3 дня.")
 
 # === Список подписок ===
 async def list_subs(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -659,7 +579,7 @@ async def list_subs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = "📋 Ваши подписки:\n\n"
     keyboard = []
     for s in user_subs:
-        sub_id, _, typ, origin, dest, d_from, d_to, max_price, category, airline, active, round_trip = s
+        sub_id, _, origin, dest, d_from, d_to, max_price, active, round_trip = s
         status = "✅ Активна" if active == 1 else "⏸ Приостановлена"
         text += f"#{sub_id}: {origin}→{dest}, {d_from}" + (f" – {d_to}" if d_to else "") + f"\n   {status}"
         if max_price:
@@ -740,7 +660,7 @@ async def pause_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     subs = get_subs(active_only=False)
     for s in subs:
-        if s[1] == user_id and s[10] == 1:
+        if s[1] == user_id and s[7] == 1:
             toggle_sub(s[0], user_id, 0)
     await query.edit_message_text("⏸ Все подписки приостановлены.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="back")]]))
 
@@ -748,7 +668,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     await query.edit_message_text(
-        "🤖 Бот ищет:\n1) Субсидии Аэрофлота\n2) Дешёвые билеты Aviasales\n\n"
+        "🤖 Бот ищет дешёвые билеты через Aviasales.\n"
         "➕ Умный поиск ±3 дня, если на точные даты нет билетов.\n"
         "💰 Цену можно пропустить.\n"
         "📊 Смотрите историю найденных билетов.",
@@ -771,31 +691,20 @@ async def back(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def check_all(context: ContextTypes.DEFAULT_TYPE):
     subs = get_subs(active_only=True)
     for sub in subs:
-        sub_id, user_id, typ, origin, dest, d_from, d_to, max_price, category, airline, active, round_trip = sub
+        sub_id, user_id, origin, dest, d_from, d_to, max_price, active, round_trip = sub
         if active != 1:
             continue
         date_list = expand_dates(d_from, d_to, days=3)
-        if typ == 'subsidy':
-            tickets = fetch_subsidy(origin, dest, date_list, category)
-            for t in tickets:
+        tickets = fetch_aviasales(origin, dest, date_list)
+        for t in tickets:
+            if max_price is None or t['price'] <= max_price:
                 add_found(sub_id, t["date"], t["price"], t["link"])
                 keyboard = [[InlineKeyboardButton("✈️ Купить", url=t["link"])]]
                 context.bot.send_message(
                     chat_id=user_id,
-                    text=f"🎫 СУБСИДИРОВАННЫЙ БИЛЕТ ПОЯВИЛСЯ!\n📍 {origin}→{dest}\n📅 {t['date']}\n💵 {t['price']} ₽",
+                    text=f"💰 НАЙДЕН БИЛЕТ!\n📍 {origin}→{dest}\n📅 {t['date']}\n💵 {t['price']} ₽" + (f" (порог {max_price} ₽)" if max_price else ""),
                     reply_markup=InlineKeyboardMarkup(keyboard)
                 )
-        else:
-            tickets = fetch_aviasales(origin, dest, date_list)
-            for t in tickets:
-                if max_price is None or t['price'] <= max_price:
-                    add_found(sub_id, t["date"], t["price"], t["link"])
-                    keyboard = [[InlineKeyboardButton("✈️ Купить", url=t["link"])]]
-                    context.bot.send_message(
-                        chat_id=user_id,
-                        text=f"💰 НАЙДЕН БИЛЕТ!\n📍 {origin}→{dest}\n📅 {t['date']}\n💵 {t['price']} ₽" + (f" (порог {max_price} ₽)" if max_price else ""),
-                        reply_markup=InlineKeyboardMarkup(keyboard)
-                    )
 
 # === Main ===
 def main():
@@ -818,7 +727,6 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_date_to_text)
             ],
             PRICE: [CallbackQueryHandler(price_chosen, pattern="^price_"), MessageHandler(filters.TEXT & ~filters.COMMAND, price_manual)],
-            AIRLINE: [CallbackQueryHandler(airline_chosen, pattern="^airline_")],
             CITY_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, origin_manual)],
         },
         fallbacks=[CallbackQueryHandler(back, pattern="^back$")],
