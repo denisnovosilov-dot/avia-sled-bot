@@ -6,7 +6,6 @@ import sys
 import logging
 import sqlite3
 import re
-import time
 from datetime import datetime, timedelta
 from threading import Lock
 from dotenv import load_dotenv
@@ -17,12 +16,6 @@ from telegram.ext import (
     ConversationHandler, MessageHandler, filters
 )
 from apscheduler.schedulers.background import BackgroundScheduler
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from bs4 import BeautifulSoup
 
 # === Конфигурация ===
 load_dotenv()
@@ -158,62 +151,17 @@ def fetch_aviasales(origin, dest, date_list):
             if resp.status_code == 200:
                 data = resp.json()
                 if data.get("success") and data.get("data"):
-                    # data - это объект с ключами-датами
+                    # data — это объект, ключи — даты, значение — информация о билете
                     for d, info in data["data"].items():
                         price = info.get("price")
                         if price is not None:
                             link = f"https://www.aviasales.ru/search/{origin}{dest}{d}"
                             results.append({"date": d, "price": price, "link": link})
                             break  # берём первую найденную цену для этой даты
+                else:
+                    logger.warning(f"Aviasales вернул ошибку: {data}")
         except Exception as e:
             logger.error(f"Ошибка Aviasales: {e}")
-    return results
-
-# === Функция поиска субсидий через Selenium ===
-def fetch_subsidy_selenium(origin, dest, date_list, category='SRC'):
-    """
-    Парсит сайт Аэрофлота через Selenium, обходя Cloudflare.
-    Возвращает список билетов с датой и ценой.
-    """
-    results = []
-    options = Options()
-    options.add_argument("--headless")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--window-size=1920,1080")
-    driver = None
-    try:
-        driver = webdriver.Chrome(options=options)
-        for date_str in date_list:
-            url = f"https://www.aeroflot.ru/ru-ru/pbsa/search?origin={origin}&destination={dest}&date={date_str}&fareType={category}"
-            logger.info(f"Открываем страницу: {url}")
-            driver.get(url)
-            # Ждём, пока загрузится страница (может быть капча, но Selenium справится)
-            wait = WebDriverWait(driver, 30)
-            # Ждём появления элемента с ценами (например, класс "price")
-            try:
-                wait.until(EC.presence_of_element_located((By.CLASS_NAME, "price")))
-            except:
-                logger.warning("Не удалось найти цены на странице, возможно, капча.")
-                continue
-            html = driver.page_source
-            soup = BeautifulSoup(html, 'html.parser')
-            # Ищем все элементы с ценой (нужно подобрать селектор)
-            price_elements = soup.find_all(class_=re.compile(r'price|ticket|fare'))
-            for elem in price_elements:
-                text = elem.get_text(strip=True)
-                numbers = re.findall(r'\d+', text)
-                if numbers:
-                    price = int(numbers[0])
-                    link = f"https://www.aeroflot.ru/ru-ru/pbsa/search?origin={origin}&destination={dest}&date={date_str}"
-                    results.append({"date": date_str, "price": price, "link": link})
-                    break
-        driver.quit()
-    except Exception as e:
-        logger.error(f"Ошибка Selenium: {e}")
-        if driver:
-            driver.quit()
     return results
 
 # === Умный поиск с расширением дат ±3 дня ===
@@ -294,7 +242,6 @@ async def new_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     keyboard = [
         [InlineKeyboardButton("💰 Дешёвые (Aviasales)", callback_data="type_aviasales")],
-        [InlineKeyboardButton("🛫 Субсидированные (Аэрофлот)", callback_data="type_subsidy")],
         [InlineKeyboardButton("↩️ Назад", callback_data="back")]
     ]
     await query.edit_message_text("Выберите тип билетов:", reply_markup=InlineKeyboardMarkup(keyboard))
@@ -303,8 +250,7 @@ async def new_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def type_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    typ = query.data.split("_")[1]
-    context.user_data['type'] = typ
+    # Мы всегда используем Aviasales
     keyboard = []
     for city, code in CITIES.items():
         keyboard.append([InlineKeyboardButton(f"{city} ({code})", callback_data=f"origin_{code}")])
@@ -583,7 +529,7 @@ async def price_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def finish(update, context):
     user_id = update.effective_user.id
-    typ = context.user_data['type']
+    typ = "aviasales"  # всегда aviasales
     origin = context.user_data['origin']
     dest = context.user_data['dest']
     d_from = context.user_data['date_from']
@@ -604,28 +550,25 @@ async def finish(update, context):
     else:
         await update.message.reply_text("✅ Подписка добавлена!")
     if sub_id:
-        await immediate_check(update, context, sub_id, user_id, typ, origin, dest, d_from, d_to, max_price)
+        await immediate_check(update, context, sub_id, user_id, origin, dest, d_from, d_to, max_price)
     return ConversationHandler.END
 
-async def immediate_check(update, context, sub_id, user_id, typ, origin, dest, d_from, d_to, max_price):
+async def immediate_check(update, context, sub_id, user_id, origin, dest, d_from, d_to, max_price):
     date_list = expand_dates(d_from, d_to, days=3)
-    if typ == 'aviasales':
-        tickets = fetch_aviasales(origin, dest, date_list)
-    else:
-        tickets = fetch_subsidy_selenium(origin, dest, date_list)
+    tickets = fetch_aviasales(origin, dest, date_list)
     found = False
     for t in tickets:
         if max_price is None or t['price'] <= max_price:
             keyboard = [[InlineKeyboardButton("✈️ Купить", url=t["link"])]]
             await context.bot.send_message(
                 chat_id=user_id,
-                text=f"{'💰 БИЛЕТ ПО ВАШЕЙ ЦЕНЕ!' if typ=='aviasales' else '🎫 СУБСИДИРОВАННЫЙ БИЛЕТ!'}\n📍 {origin}→{dest}\n📅 {t['date']}\n💵 {t['price']} ₽" + (f" (порог {max_price} ₽)" if max_price else ""),
+                text=f"💰 БИЛЕТ ПО ВАШЕЙ ЦЕНЕ!\n📍 {origin}→{dest}\n📅 {t['date']}\n💵 {t['price']} ₽" + (f" (порог {max_price} ₽)" if max_price else ""),
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
             add_found(sub_id, t['date'], t['price'], t['link'])
             found = True
     if not found:
-        await context.bot.send_message(chat_id=user_id, text="🔍 Пока билетов по вашим условиям нет. Будем отслеживать с запасом ±3 дня.")
+        await context.bot.send_message(chat_id=user_id, text="🔍 Пока билетов по вашей цене нет. Будем отслеживать с запасом ±3 дня.")
 
 # === Список подписок ===
 async def list_subs(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -729,8 +672,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     await query.edit_message_text(
-        "🤖 Бот ищет дешёвые билеты через Aviasales и субсидированные Аэрофлота.\n"
-        "➕ Умный поиск ±3 дня.\n"
+        "🤖 Бот ищет дешёвые билеты через Aviasales.\n"
+        "➕ Умный поиск ±3 дня, если на точные даты нет билетов.\n"
         "💰 Цену можно пропустить.\n"
         "📊 История найденных билетов.",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="back")]])
@@ -756,17 +699,14 @@ def check_all(context: ContextTypes.DEFAULT_TYPE):
         if active != 1:
             continue
         date_list = expand_dates(d_from, d_to, days=3)
-        if typ == 'aviasales':
-            tickets = fetch_aviasales(origin, dest, date_list)
-        else:
-            tickets = fetch_subsidy_selenium(origin, dest, date_list)
+        tickets = fetch_aviasales(origin, dest, date_list)
         for t in tickets:
             if max_price is None or t['price'] <= max_price:
                 add_found(sub_id, t["date"], t["price"], t["link"])
                 keyboard = [[InlineKeyboardButton("✈️ Купить", url=t["link"])]]
                 context.bot.send_message(
                     chat_id=user_id,
-                    text=f"{'💰 НАЙДЕН БИЛЕТ!' if typ=='aviasales' else '🎫 СУБСИДИРОВАННЫЙ БИЛЕТ!'}\n📍 {origin}→{dest}\n📅 {t['date']}\n💵 {t['price']} ₽" + (f" (порог {max_price} ₽)" if max_price else ""),
+                    text=f"💰 НАЙДЕН БИЛЕТ!\n📍 {origin}→{dest}\n📅 {t['date']}\n💵 {t['price']} ₽" + (f" (порог {max_price} ₽)" if max_price else ""),
                     reply_markup=InlineKeyboardMarkup(keyboard)
                 )
 
