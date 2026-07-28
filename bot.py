@@ -5,73 +5,52 @@ import os
 import sys
 import logging
 import sqlite3
-import json
-import re
 from datetime import datetime, timedelta
 from threading import Lock
 from dotenv import load_dotenv
-
 import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-    ConversationHandler,
-    MessageHandler,
-    filters,
+    Application, CommandHandler, CallbackQueryHandler, ContextTypes,
+    ConversationHandler, MessageHandler, filters
 )
 from apscheduler.schedulers.background import BackgroundScheduler
 
-# ================== КОНФИГУРАЦИЯ ================================
+# === Конфигурация ===
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 AVIASALES_TOKEN = os.getenv("AVIASALES_TOKEN")
-
 if not TELEGRAM_TOKEN or not AVIASALES_TOKEN:
-    print("=" * 60)
-    print("Токены не найдены. Введите их сейчас:")
+    print("Введите токены:")
     tg = input("TELEGRAM_TOKEN: ").strip()
     av = input("AVIASALES_TOKEN: ").strip()
     with open(".env", "w") as f:
         f.write(f"TELEGRAM_TOKEN={tg}\nAVIASALES_TOKEN={av}\n")
-    print("Сохранено. Перезапустите бота.")
+    print("Сохранено. Перезапустите.")
     sys.exit(0)
 
-CHECK_INTERVAL_MINUTES = 10
-# ================================================================
+CHECK_INTERVAL = 10  # минут
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# ---------- Состояния для ConversationHandler ----------
-(
-    SELECT_TYPE,
-    SELECT_ORIGIN,
-    SELECT_DEST,
-    SELECT_DATE_FROM,
-    SELECT_DATE_TO,
-    SELECT_PRICE,
-    SELECT_AIRLINE,
-    ENTER_CITY_ORIGIN,
-    ENTER_CITY_DEST,
-) = range(9)
+# === Состояния ===
+TYPE, ORIGIN, DEST, DATE_FROM, DATE_TO, PRICE, AIRLINE, CITY_INPUT = range(8)
 
-# ---------- База данных ----------
+# === База данных ===
 DB_NAME = "subscriptions.db"
-db_lock = Lock()
+lock = Lock()
 
 def init_db():
-    with db_lock:
+    with lock:
         conn = sqlite3.connect(DB_NAME)
         c = conn.cursor()
-        c.execute('''CREATE TABLE IF NOT EXISTS subscriptions (
+        c.execute('''CREATE TABLE IF NOT EXISTS subs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
             type TEXT,
             origin TEXT,
-            destination TEXT,
+            dest TEXT,
             date_from TEXT,
             date_to TEXT,
             max_price INTEGER,
@@ -79,7 +58,7 @@ def init_db():
             airline TEXT,
             active INTEGER DEFAULT 1
         )''')
-        c.execute('''CREATE TABLE IF NOT EXISTS found_tickets (
+        c.execute('''CREATE TABLE IF NOT EXISTS found (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             sub_id INTEGER,
             date TEXT,
@@ -90,176 +69,138 @@ def init_db():
         conn.commit()
         conn.close()
 
-def get_subscriptions(active_only=True):
-    with db_lock:
+def get_subs(active_only=True):
+    with lock:
         conn = sqlite3.connect(DB_NAME)
         c = conn.cursor()
-        query = "SELECT id, user_id, type, origin, destination, date_from, date_to, max_price, category, airline FROM subscriptions"
+        q = "SELECT id, user_id, type, origin, dest, date_from, date_to, max_price, category, airline FROM subs"
         if active_only:
-            query += " WHERE active=1"
-        c.execute(query)
+            q += " WHERE active=1"
         rows = c.fetchall()
         conn.close()
         return rows
 
-def add_subscription(user_id, sub_type, origin, dest, date_from, date_to, max_price=None, category='SRC', airline=None):
-    with db_lock:
+def add_sub(user_id, typ, origin, dest, d_from, d_to, max_price=None, category='SRC', airline=None):
+    with lock:
         conn = sqlite3.connect(DB_NAME)
         c = conn.cursor()
-        c.execute('''INSERT INTO subscriptions 
-                     (user_id, type, origin, destination, date_from, date_to, max_price, category, airline)
-                     VALUES (?,?,?,?,?,?,?,?,?)''',
-                  (user_id, sub_type, origin, dest, date_from, date_to, max_price, category, airline))
+        c.execute('''INSERT INTO subs 
+            (user_id, type, origin, dest, date_from, date_to, max_price, category, airline)
+            VALUES (?,?,?,?,?,?,?,?,?)''',
+            (user_id, typ, origin, dest, d_from, d_to, max_price, category, airline))
         conn.commit()
         conn.close()
 
-def delete_subscription(sub_id, user_id):
-    with db_lock:
+def delete_sub(sub_id, user_id):
+    with lock:
         conn = sqlite3.connect(DB_NAME)
         c = conn.cursor()
-        c.execute("DELETE FROM subscriptions WHERE id=? AND user_id=?", (sub_id, user_id))
+        c.execute("DELETE FROM subs WHERE id=? AND user_id=?", (sub_id, user_id))
         conn.commit()
         conn.close()
 
-def toggle_subscription(sub_id, user_id, active):
-    with db_lock:
+def toggle_sub(sub_id, user_id, active):
+    with lock:
         conn = sqlite3.connect(DB_NAME)
         c = conn.cursor()
-        c.execute("UPDATE subscriptions SET active=? WHERE id=? AND user_id=?", (active, sub_id, user_id))
+        c.execute("UPDATE subs SET active=? WHERE id=? AND user_id=?", (active, sub_id, user_id))
         conn.commit()
         conn.close()
 
-def add_found_ticket(sub_id, date, price, link):
-    with db_lock:
+def add_found(sub_id, date, price, link):
+    with lock:
         conn = sqlite3.connect(DB_NAME)
         c = conn.cursor()
-        c.execute('''INSERT INTO found_tickets (sub_id, date, price, link, notified)
-                     VALUES (?,?,?,?,0)''', (sub_id, date, price, link))
+        c.execute("INSERT INTO found (sub_id, date, price, link, notified) VALUES (?,?,?,?,0)",
+                  (sub_id, date, price, link))
         conn.commit()
         conn.close()
 
-def mark_notified(ticket_id):
-    with db_lock:
-        conn = sqlite3.connect(DB_NAME)
-        c = conn.cursor()
-        c.execute("UPDATE found_tickets SET notified=1 WHERE id=?", (ticket_id,))
-        conn.commit()
-        conn.close()
-
-# ---------- Словари городов и авиакомпаний ----------
+# === Города и авиакомпании ===
 CITIES = {
-    "Москва": "MOW",
-    "Санкт-Петербург": "LED",
-    "Владивосток": "VVO",
-    "Сочи": "AER",
-    "Екатеринбург": "SVX",
-    "Новосибирск": "OVB",
-    "Красноярск": "KJA",
-    "Иркутск": "IKT",
-    "Хабаровск": "KHV",
-    "Южно-Сахалинск": "UUS",
-    "Калининград": "KGD",
-    "Казань": "KZN",
-    "Самара": "KUF",
-    "Ростов-на-Дону": "ROV",
+    "Москва": "MOW", "Санкт-Петербург": "LED", "Владивосток": "VVO",
+    "Сочи": "AER", "Екатеринбург": "SVX", "Новосибирск": "OVB",
+    "Красноярск": "KJA", "Иркутск": "IKT", "Хабаровск": "KHV",
+    "Южно-Сахалинск": "UUS", "Калининград": "KGD", "Казань": "KZN",
+    "Самара": "KUF", "Ростов-на-Дону": "ROV"
 }
-AIRLINES = ["Аэрофлот", "S7", "Победа", "Уральские авиалинии", "Utair", "Nordwind", "Икар", "Не важно"]
+AIRLINES = ["Аэрофлот", "S7", "Победа", "Уральские авиалинии", "Utair", "Nordwind", "Икар", "Любая"]
 
-# ---------- Функции поиска (без изменений) ----------
-def fetch_subsidy_flights(origin, destination, date_from, date_to, category='SRC'):
+# === Функции поиска ===
+def fetch_subsidy(origin, dest, d_from, d_to, category='SRC'):
     results = []
-    api_url = "https://www.aeroflot.ru/api/ru-RU/search/flights"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Content-Type": "application/json",
-        "Accept": "application/json"
-    }
-    start = datetime.strptime(date_from, "%Y-%m-%d")
-    end = datetime.strptime(date_to, "%Y-%m-%d")
+    start = datetime.strptime(d_from, "%Y-%m-%d")
+    end = datetime.strptime(d_to, "%Y-%m-%d")
     delta = timedelta(days=1)
-    current = start
-    while current <= end:
-        date_str = current.strftime("%Y-%m-%d")
+    cur = start
+    while cur <= end:
+        date_str = cur.strftime("%Y-%m-%d")
+        url = "https://www.aeroflot.ru/api/ru-RU/search/flights"
+        headers = {"User-Agent": "Mozilla/5.0", "Content-Type": "application/json"}
         payload = {
-            "origin": origin,
-            "destination": destination,
+            "origin": origin, "destination": dest,
             "departureDate": date_str,
-            "adultCount": 1,
-            "childCount": 0,
-            "infantCount": 0,
-            "cabin": "Y",
-            "fareType": category,
+            "adultCount": 1, "childCount": 0, "infantCount": 0,
+            "cabin": "Y", "fareType": category
         }
         try:
-            resp = requests.post(api_url, json=payload, headers=headers, timeout=10)
+            resp = requests.post(url, json=payload, headers=headers, timeout=10)
             if resp.status_code == 200:
                 data = resp.json()
-                if "segments" in data:
-                    for seg in data["segments"]:
-                        if seg.get("fareType") == "SUB" or seg.get("isSubsidized") == True:
-                            price = seg.get("price", {}).get("amount", 0)
-                            link = f"https://www.aeroflot.ru/ru-ru/pbsa/search?origin={origin}&destination={destination}&date={date_str}"
-                            results.append({"date": date_str, "price": int(price) if price else 0, "link": link})
-                            break
+                for seg in data.get("segments", []):
+                    if seg.get("fareType") == "SUB" or seg.get("isSubsidized"):
+                        price = seg.get("price", {}).get("amount", 0)
+                        link = f"https://www.aeroflot.ru/ru-ru/pbsa/search?origin={origin}&destination={dest}&date={date_str}"
+                        results.append({"date": date_str, "price": int(price) if price else 0, "link": link})
+                        break
         except Exception as e:
-            logger.error(f"Ошибка API Аэрофлота: {e}")
-        current += delta
+            logger.error(f"Ошибка Аэрофлота: {e}")
+        cur += delta
     return results
 
-def fetch_aviasales_price(origin, destination, date_from, date_to):
+def fetch_aviasales(origin, dest, d_from, d_to):
     url = "https://api.travelpayouts.com/v1/prices/calendar"
     params = {
-        "origin": origin,
-        "destination": destination,
-        "depart_date": date_from,
-        "return_date": date_to,
-        "token": AVIASALES_TOKEN,
-        "currency": "rub",
-        "show_to_affiliates": "true"
+        "origin": origin, "destination": dest,
+        "depart_date": d_from, "return_date": d_to,
+        "token": AVIASALES_TOKEN, "currency": "rub", "show_to_affiliates": "true"
     }
     try:
         resp = requests.get(url, params=params, timeout=10)
         if resp.status_code == 200:
             data = resp.json()
-            if "data" in data and data["data"]:
-                prices = [d["price"] for d in data["data"] if "price" in d]
-                if prices:
-                    return {"date": date_from, "price": min(prices)}
+            prices = [d["price"] for d in data.get("data", []) if "price" in d]
+            if prices:
+                return {"date": d_from, "price": min(prices)}
     except Exception as e:
-        logger.error(f"Ошибка Aviasales API: {e}")
+        logger.error(f"Ошибка Aviasales: {e}")
     return None
 
-# ---------- Календарь (исправленный) ----------
-def create_calendar(year, month, prefix):
-    """Создаёт inline-клавиатуру для выбора дня."""
+# === Календарь (без багов) ===
+def build_calendar(year, month, prefix):
     now = datetime.now()
-    # Определяем первый день месяца и количество дней
     first_day = datetime(year, month, 1)
     if month == 12:
         last_day = datetime(year+1, 1, 1) - timedelta(days=1)
     else:
         last_day = datetime(year, month+1, 1) - timedelta(days=1)
-    start_weekday = first_day.weekday()  # 0=пн, 6=вс
-
+    start_weekday = first_day.weekday()  # 0=пн
     keyboard = []
-    # Заголовок с месяцем и годом
     month_names = ["Янв","Фев","Мар","Апр","Май","Июн","Июл","Авг","Сен","Окт","Ноя","Дек"]
     keyboard.append([InlineKeyboardButton(f"{month_names[month-1]} {year}", callback_data="ignore")])
-    # Дни недели
-    week_days = ["Пн","Вт","Ср","Чт","Пт","Сб","Вс"]
-    keyboard.append([InlineKeyboardButton(day, callback_data="ignore") for day in week_days])
+    week = ["Пн","Вт","Ср","Чт","Пт","Сб","Вс"]
+    keyboard.append([InlineKeyboardButton(d, callback_data="ignore") for d in week])
 
-    # Пустые ячейки до первого дня
     row = []
-    for i in range(start_weekday):
+    for _ in range(start_weekday):
         row.append(InlineKeyboardButton(" ", callback_data="ignore"))
     day = 1
     while day <= last_day.day:
-        date_str = f"{year}-{month:02d}-{day:02d}"
-        # Нельзя выбирать прошедшие дни
-        if datetime(year, month, day).date() < now.date():
+        date_obj = datetime(year, month, day)
+        if date_obj.date() < now.date():
             btn = InlineKeyboardButton(str(day), callback_data="ignore")
         else:
+            date_str = f"{year}-{month:02d}-{day:02d}"
             btn = InlineKeyboardButton(str(day), callback_data=f"{prefix}_{date_str}")
         row.append(btn)
         if len(row) == 7:
@@ -267,8 +208,12 @@ def create_calendar(year, month, prefix):
             row = []
         day += 1
     if row:
+        # Добиваем пустыми кнопками, чтобы ряд был полным
+        while len(row) < 7:
+            row.append(InlineKeyboardButton(" ", callback_data="ignore"))
         keyboard.append(row)
-    # Кнопки навигации
+
+    # Навигация
     nav = []
     if month > 1:
         nav.append(InlineKeyboardButton("◀️", callback_data=f"{prefix}_prev_{year}_{month-1}"))
@@ -281,179 +226,113 @@ def create_calendar(year, month, prefix):
     keyboard.append(nav)
     return InlineKeyboardMarkup(keyboard)
 
-# ---------- Функция проверки и отображения билетов сразу ----------
-async def show_immediate_tickets(update, context, subscription_id):
-    """Проверяет билеты для подписки и отправляет их пользователю, если есть."""
-    sub = get_subscription_by_id(subscription_id)
-    if not sub:
-        return
-    user_id, sub_type, origin, dest, date_from, date_to, max_price, category, airline = sub
-    if sub_type == 'subsidy':
-        tickets = fetch_subsidy_flights(origin, dest, date_from, date_to, category)
-        if tickets:
-            for ticket in tickets:
-                keyboard = [[InlineKeyboardButton("✈️ Купить", url=ticket["link"])]]
-                await context.bot.send_message(
-                    chat_id=user_id,
-                    text=f"🎫 СУБСИДИРОВАННЫЙ БИЛЕТ ДОСТУПЕН ПРЯМО СЕЙЧАС!\n\n"
-                         f"📍 {origin} → {dest}\n"
-                         f"📅 {ticket['date']}\n"
-                         f"💵 Цена фиксированная (льготная)\n"
-                         f"❗ Успейте купить!",
-                    reply_markup=InlineKeyboardMarkup(keyboard)
-                )
-        else:
-            await context.bot.send_message(
-                chat_id=user_id,
-                text="🔍 Пока билетов нет. Будет отслеживать и пришлёт уведомление при появлении."
-            )
-    elif sub_type == 'aviasales':
-        result = fetch_aviasales_price(origin, dest, date_from, date_to)
-        if result and max_price and result["price"] <= max_price:
-            keyboard = [[InlineKeyboardButton("✈️ Купить", url=f"https://www.aviasales.ru/search/{origin}{dest}{result['date']}")]]
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=f"💰 БИЛЕТ ПО ВАШЕЙ ЦЕНЕ УЖЕ ЕСТЬ!\n\n"
-                     f"📍 {origin} → {dest}\n"
-                     f"📅 {result['date']}\n"
-                     f"💵 {result['price']} ₽ (ваш порог: {max_price} ₽)\n"
-                     f"🔄 Цена может вырасти!",
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
-        else:
-            await context.bot.send_message(
-                chat_id=user_id,
-                text="🔍 Пока билетов по вашей цене нет. Будет отслеживать и пришлёт уведомление."
-            )
-
-# ---------- Обработчики команд ----------
+# === Обработчики ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
-        [InlineKeyboardButton("🔍 Новый поиск", callback_data="new_search")],
-        [InlineKeyboardButton("📋 Мои подписки", callback_data="my_subs")],
+        [InlineKeyboardButton("🔍 Новый поиск", callback_data="new")],
+        [InlineKeyboardButton("📋 Мои подписки", callback_data="list")],
         [InlineKeyboardButton("❓ Помощь", callback_data="help")],
         [InlineKeyboardButton("⏸ Приостановить все", callback_data="pause_all")]
     ]
-    await update.message.reply_text(
-        "✈️ Привет! Я бот-помощник для поиска авиабилетов.\n"
-        "Выберите действие:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    await update.message.reply_text("✈️ Привет! Выберите действие:", reply_markup=InlineKeyboardMarkup(keyboard))
 
-async def start_new_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def new_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     keyboard = [
         [InlineKeyboardButton("🛫 Субсидированный (Аэрофлот)", callback_data="type_subsidy")],
         [InlineKeyboardButton("💰 Дешёвые (Aviasales)", callback_data="type_aviasales")],
-        [InlineKeyboardButton("↩️ Назад", callback_data="back_main")]
+        [InlineKeyboardButton("↩️ Назад", callback_data="back")]
     ]
-    await query.edit_message_text(
-        "Выберите тип билетов:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-    return SELECT_TYPE
+    await query.edit_message_text("Выберите тип билетов:", reply_markup=InlineKeyboardMarkup(keyboard))
+    return TYPE
 
-async def select_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def type_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    sub_type = query.data.split("_")[1]
-    context.user_data['sub_type'] = sub_type
-    # Показываем список городов
+    typ = query.data.split("_")[1]
+    context.user_data['type'] = typ
     keyboard = []
     for city, code in CITIES.items():
         keyboard.append([InlineKeyboardButton(f"{city} ({code})", callback_data=f"origin_{code}")])
     keyboard.append([InlineKeyboardButton("✏️ Ввести другой", callback_data="origin_manual")])
-    keyboard.append([InlineKeyboardButton("↩️ Назад", callback_data="new_search")])
-    await query.edit_message_text(
-        "📍 Выберите город вылета:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-    return SELECT_ORIGIN
+    keyboard.append([InlineKeyboardButton("↩️ Назад", callback_data="back")])
+    await query.edit_message_text("📍 Выберите город вылета:", reply_markup=InlineKeyboardMarkup(keyboard))
+    return ORIGIN
 
-async def select_origin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def origin_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
     if data == "origin_manual":
-        await query.edit_message_text("Введите название города вылета (на русском или IATA-код):")
-        return ENTER_CITY_ORIGIN
+        await query.edit_message_text("Введите название города (на русском или IATA-код):")
+        return CITY_INPUT
     else:
-        origin = data.split("_")[1]
-        context.user_data['origin'] = origin
-        return await show_dest_list(update, context)
+        context.user_data['origin'] = data.split("_")[1]
+        return await show_dest(update, context)
 
-async def enter_city_origin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    city = update.message.text.strip().upper()
-    # Проверяем, есть ли в словаре
-    if city in CITIES.values() or city in CITIES.keys():
-        # Если пользователь ввёл IATA-код или название
-        for name, code in CITIES.items():
-            if city == code or city == name.upper():
-                context.user_data['origin'] = code
-                break
+async def origin_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip().upper()
+    # Проверяем, есть ли в CITIES
+    for city, code in CITIES.items():
+        if text == code or text == city.upper():
+            context.user_data['origin'] = code
+            break
     else:
-        # Если город не найден, используем введённый как IATA
-        context.user_data['origin'] = city  # пользователь сам ввёл код
-    # Переходим к выбору города назначения
-    return await show_dest_list(update, context)
+        context.user_data['origin'] = text  # пользователь ввел IATA-код
+    return await show_dest(update, context)
 
-async def show_dest_list(update, context):
-    """Показывает список городов для прилёта."""
+async def show_dest(update, context):
     keyboard = []
     for city, code in CITIES.items():
-        if code != context.user_data.get('origin'):
+        if code != context.user_data['origin']:
             keyboard.append([InlineKeyboardButton(f"{city} ({code})", callback_data=f"dest_{code}")])
     keyboard.append([InlineKeyboardButton("✏️ Ввести другой", callback_data="dest_manual")])
-    keyboard.append([InlineKeyboardButton("↩️ Назад", callback_data="new_search")])
-    if isinstance(update, Update) and update.callback_query:
+    keyboard.append([InlineKeyboardButton("↩️ Назад", callback_data="back")])
+    if update.callback_query:
         await update.callback_query.edit_message_text(
-            f"📍 Вылет из {context.user_data['origin']}. Теперь выберите город прилёта:",
+            f"📍 Вылет из {context.user_data['origin']}. Теперь город прилёта:",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
     else:
         await update.message.reply_text(
-            f"📍 Вылет из {context.user_data['origin']}. Теперь выберите город прилёта:",
+            f"📍 Вылет из {context.user_data['origin']}. Теперь город прилёта:",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
-    return SELECT_DEST
+    return DEST
 
-async def select_destination(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def dest_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
     if data == "dest_manual":
-        await query.edit_message_text("Введите название города прилёта (на русском или IATA-код):")
-        return ENTER_CITY_DEST
+        await query.edit_message_text("Введите город прилёта:")
+        return CITY_INPUT
     else:
-        dest = data.split("_")[1]
-        context.user_data['dest'] = dest
-        # Показываем календарь для даты вылета
+        context.user_data['dest'] = data.split("_")[1]
         now = datetime.now()
         await query.edit_message_text(
             "📅 Выберите дату вылета (кликните по дню):",
-            reply_markup=create_calendar(now.year, now.month, "date_from")
+            reply_markup=build_calendar(now.year, now.month, "from")
         )
-        return SELECT_DATE_FROM
+        return DATE_FROM
 
-async def enter_city_dest(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    city = update.message.text.strip().upper()
-    if city in CITIES.values() or city in CITIES.keys():
-        for name, code in CITIES.items():
-            if city == code or city == name.upper():
-                context.user_data['dest'] = code
-                break
+async def dest_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip().upper()
+    for city, code in CITIES.items():
+        if text == code or text == city.upper():
+            context.user_data['dest'] = code
+            break
     else:
-        context.user_data['dest'] = city
-    # Теперь показываем календарь
+        context.user_data['dest'] = text
     now = datetime.now()
     await update.message.reply_text(
-        "📅 Выберите дату вылета (кликните по дню):",
-        reply_markup=create_calendar(now.year, now.month, "date_from")
+        "📅 Выберите дату вылета:",
+        reply_markup=build_calendar(now.year, now.month, "from")
     )
-    return SELECT_DATE_FROM
+    return DATE_FROM
 
-async def calendar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def calendar_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
@@ -461,170 +340,186 @@ async def calendar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prefix = parts[0]
     if prefix == "ignore":
         return
-    if prefix in ("date_from", "date_to"):
-        # Выбрана дата
+    if prefix == "from":
+        # выбрана дата вылета
         date_str = parts[1]
-        # Проверяем, что дата не прошла
         if datetime.strptime(date_str, "%Y-%m-%d").date() < datetime.now().date():
-            await query.edit_message_text("❌ Нельзя выбрать прошедшую дату. Выберите другую.")
+            await query.edit_message_text("❌ Нельзя выбрать прошлое.")
             return
-        if prefix == "date_from":
-            context.user_data['date_from'] = date_str
-            # Сохраняем текущий префикс для навигации
-            context.user_data['calendar_prefix'] = "date_to"
-            # Показываем календарь для даты возврата (можно выбрать ту же)
-            await query.edit_message_text(
-                f"✅ Дата вылета: {date_str}\nТеперь выберите дату возврата (или ту же, если нужен только туда):",
-                reply_markup=create_calendar(
-                    datetime.strptime(date_str, "%Y-%m-%d").year,
-                    datetime.strptime(date_str, "%Y-%m-%d").month,
-                    "date_to"
-                )
+        context.user_data['date_from'] = date_str
+        # теперь календарь для даты возврата
+        await query.edit_message_text(
+            f"✅ Вылет: {date_str}\nТеперь выберите дату возврата (или ту же):",
+            reply_markup=build_calendar(
+                datetime.strptime(date_str, "%Y-%m-%d").year,
+                datetime.strptime(date_str, "%Y-%m-%d").month,
+                "to"
             )
-            return SELECT_DATE_TO
-        else:  # date_to
-            context.user_data['date_to'] = date_str
-            # Переходим к следующему шагу
-            if context.user_data.get('sub_type') == 'aviasales':
-                # Запрашиваем цену
-                keyboard = [
-                    [InlineKeyboardButton("5000", callback_data="price_5000"),
-                     InlineKeyboardButton("10000", callback_data="price_10000"),
-                     InlineKeyboardButton("15000", callback_data="price_15000"),
-                     InlineKeyboardButton("20000", callback_data="price_20000")],
-                    [InlineKeyboardButton("✏️ Ввести свою", callback_data="price_custom")],
-                    [InlineKeyboardButton("↩️ Назад", callback_data="new_search")]
-                ]
-                await query.edit_message_text(
-                    "💰 Укажите максимальную цену (выберите или введите свою):",
-                    reply_markup=InlineKeyboardMarkup(keyboard)
-                )
-                return SELECT_PRICE
-            else:
-                # Для субсидий пропускаем цену и авиакомпанию
-                await finish_subscription(update, context)
-                return ConversationHandler.END
+        )
+        return DATE_TO
+    elif prefix == "to":
+        date_str = parts[1]
+        if datetime.strptime(date_str, "%Y-%m-%d").date() < datetime.now().date():
+            await query.edit_message_text("❌ Нельзя выбрать прошлое.")
+            return
+        context.user_data['date_to'] = date_str
+        # Переход к цене или завершению
+        if context.user_data.get('type') == 'aviasales':
+            keyboard = [
+                [InlineKeyboardButton("5000", callback_data="price_5000"),
+                 InlineKeyboardButton("10000", callback_data="price_10000"),
+                 InlineKeyboardButton("15000", callback_data="price_15000"),
+                 InlineKeyboardButton("20000", callback_data="price_20000")],
+                [InlineKeyboardButton("✏️ Своя", callback_data="price_custom")],
+                [InlineKeyboardButton("↩️ Назад", callback_data="back")]
+            ]
+            await query.edit_message_text("💰 Укажите максимальную цену:", reply_markup=InlineKeyboardMarkup(keyboard))
+            return PRICE
+        else:
+            # Субсидия
+            return await finish(update, context)
     else:
-        # Навигация по календарю
-        action = parts[1]  # prev или next
+        # Навигация
+        action = parts[1]
         year = int(parts[2])
         month = int(parts[3])
         if action == "prev":
-            if month < 1:
-                month = 12
+            if month == 1:
                 year -= 1
-        elif action == "next":
-            if month > 12:
-                month = 1
+                month = 12
+            else:
+                month -= 1
+        else:  # next
+            if month == 12:
                 year += 1
-        # Определяем, какой это календарь (date_from или date_to)
-        current_prefix = context.user_data.get('calendar_prefix', 'date_from')
+                month = 1
+            else:
+                month += 1
+        # Определяем, какой префикс у текущего календаря
+        current_prefix = context.user_data.get('calendar_prefix', 'from')
         await query.edit_message_reply_markup(
-            reply_markup=create_calendar(year, month, current_prefix)
+            reply_markup=build_calendar(year, month, current_prefix)
         )
         return
 
-async def select_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def price_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
     if data == "price_custom":
-        await query.edit_message_text("Введите максимальную цену числом (только цифры):")
-        return SELECT_PRICE
+        await query.edit_message_text("Введите цену числом:")
+        return PRICE
     else:
-        price = int(data.split("_")[1])
-        context.user_data['max_price'] = price
-        # Переходим к выбору авиакомпании
+        context.user_data['max_price'] = int(data.split("_")[1])
         return await show_airlines(update, context)
 
-async def handle_price_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def price_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         price = int(update.message.text.strip())
         context.user_data['max_price'] = price
         await update.message.reply_text(f"✅ Цена {price} ₽ сохранена.")
         return await show_airlines(update, context)
-    except ValueError:
-        await update.message.reply_text("❌ Пожалуйста, введите число.")
-        return SELECT_PRICE
+    except:
+        await update.message.reply_text("❌ Введите число.")
+        return PRICE
 
 async def show_airlines(update, context):
-    """Показывает список авиакомпаний для фильтрации."""
     keyboard = []
     for airline in AIRLINES:
         keyboard.append([InlineKeyboardButton(airline, callback_data=f"airline_{airline}")])
-    keyboard.append([InlineKeyboardButton("↩️ Назад", callback_data="new_search")])
-    if isinstance(update, Update) and update.callback_query:
+    keyboard.append([InlineKeyboardButton("↩️ Назад", callback_data="back")])
+    if update.callback_query:
         await update.callback_query.edit_message_text(
-            "✈️ Выберите авиакомпанию (или 'Не важно' для всех):",
+            "✈️ Выберите авиакомпанию (или 'Любая'):",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
     else:
         await update.message.reply_text(
-            "✈️ Выберите авиакомпанию (или 'Не важно' для всех):",
+            "✈️ Выберите авиакомпанию:",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
-    return SELECT_AIRLINE
+    return AIRLINE
 
-async def select_airline(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def airline_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     airline = query.data.split("_")[1]
-    if airline == "Не важно":
+    if airline == "Любая":
         airline = None
     context.user_data['airline'] = airline
-    # Завершаем подписку
-    await finish_subscription(update, context)
-    return ConversationHandler.END
+    return await finish(update, context)
 
-async def finish_subscription(update, context):
-    """Сохраняет подписку и сразу показывает билеты, если есть."""
+async def finish(update, context):
     user_id = update.effective_user.id
-    sub_type = context.user_data.get('sub_type')
-    origin = context.user_data.get('origin')
-    dest = context.user_data.get('dest')
-    date_from = context.user_data.get('date_from')
-    date_to = context.user_data.get('date_to')
+    typ = context.user_data['type']
+    origin = context.user_data['origin']
+    dest = context.user_data['dest']
+    d_from = context.user_data['date_from']
+    d_to = context.user_data['date_to']
     max_price = context.user_data.get('max_price')
-    category = 'SRC' if sub_type == 'subsidy' else None
+    category = 'SRC' if typ == 'subsidy' else None
     airline = context.user_data.get('airline')
-    # Добавляем подписку
-    add_subscription(user_id, sub_type, origin, dest, date_from, date_to, max_price, category, airline)
-    # Получаем id последней добавленной подписки
-    subs = get_subscriptions(active_only=False)
+    add_sub(user_id, typ, origin, dest, d_from, d_to, max_price, category, airline)
+    # Получаем id новой подписки
+    subs = get_subs(active_only=False)
     user_subs = [s for s in subs if s[1] == user_id]
     sub_id = user_subs[-1][0] if user_subs else None
-    # Очищаем данные
     context.user_data.clear()
-    # Отправляем сообщение об успехе
+
     if update.callback_query:
         await update.callback_query.edit_message_text(
-            f"✅ Подписка добавлена!\n"
-            f"📍 {origin} → {dest}\n"
-            f"📅 {date_from} – {date_to}\n"
-            f"Тип: {'Субсидия' if sub_type=='subsidy' else 'Aviasales'}"
+            f"✅ Подписка добавлена!\n📍 {origin} → {dest}\n📅 {d_from} – {d_to}"
         )
     else:
         await update.message.reply_text("✅ Подписка добавлена!")
-    # Проверяем и показываем билеты сразу
-    if sub_id:
-        await show_immediate_tickets(update, context, sub_id)
 
-# ---------- Список подписок ----------
-async def my_subscriptions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if sub_id:
+        # Сразу проверим билеты
+        await immediate_check(update, context, sub_id, user_id, typ, origin, dest, d_from, d_to, max_price, category)
+    return ConversationHandler.END
+
+async def immediate_check(update, context, sub_id, user_id, typ, origin, dest, d_from, d_to, max_price, category):
+    if typ == 'subsidy':
+        tickets = fetch_subsidy(origin, dest, d_from, d_to, category)
+        if tickets:
+            for t in tickets:
+                keyboard = [[InlineKeyboardButton("✈️ Купить", url=t["link"])]]
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=f"🎫 СУБСИДИРОВАННЫЙ БИЛЕТ ДОСТУПЕН!\n📍 {origin}→{dest}\n📅 {t['date']}\n💵 Фиксированная цена",
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+        else:
+            await context.bot.send_message(chat_id=user_id, text="🔍 Пока билетов нет. Будем отслеживать.")
+    else:  # aviasales
+        res = fetch_aviasales(origin, dest, d_from, d_to)
+        if res and max_price and res["price"] <= max_price:
+            link = f"https://www.aviasales.ru/search/{origin}{dest}{d_from}"
+            keyboard = [[InlineKeyboardButton("✈️ Купить", url=link)]]
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"💰 БИЛЕТ ПО ВАШЕЙ ЦЕНЕ УЖЕ ЕСТЬ!\n📍 {origin}→{dest}\n📅 {res['date']}\n💵 {res['price']} ₽ (порог {max_price} ₽)",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        else:
+            await context.bot.send_message(chat_id=user_id, text="🔍 Пока билетов по вашей цене нет. Будем отслеживать.")
+
+# === Список подписок ===
+async def list_subs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
-    subs = get_subscriptions(active_only=False)
+    subs = get_subs(active_only=False)
     user_subs = [s for s in subs if s[1] == user_id]
     if not user_subs:
-        await query.edit_message_text("📭 У вас нет подписок.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="back_main")]]))
+        await query.edit_message_text("📭 У вас нет подписок.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="back")]]))
         return
     text = "📋 Ваши подписки:\n\n"
     keyboard = []
     for s in user_subs:
-        sub_id, _, sub_type, origin, dest, date_from, date_to, max_price, category, airline = s
+        sub_id, _, typ, origin, dest, d_from, d_to, max_price, category, airline = s
         status = "✅ Активна" if s[7] == 1 else "⏸ Приостановлена"
-        text += f"#{sub_id}: {origin}→{dest}, {date_from}–{date_to}\n   {status}\n"
+        text += f"#{sub_id}: {origin}→{dest}, {d_from}–{d_to}\n   {status}\n"
         row = []
         if s[7] == 1:
             row.append(InlineKeyboardButton("⏸", callback_data=f"pause_{sub_id}"))
@@ -632,10 +527,10 @@ async def my_subscriptions(update: Update, context: ContextTypes.DEFAULT_TYPE):
             row.append(InlineKeyboardButton("▶️", callback_data=f"resume_{sub_id}"))
         row.append(InlineKeyboardButton("❌", callback_data=f"delete_{sub_id}"))
         keyboard.append(row)
-    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="back_main")])
+    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="back")])
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
-async def manage_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def manage_sub(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
@@ -644,142 +539,105 @@ async def manage_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE
     sub_id = int(parts[1])
     user_id = update.effective_user.id
     if action == "pause":
-        toggle_subscription(sub_id, user_id, 0)
-        await query.edit_message_text("⏸ Подписка приостановлена.")
+        toggle_sub(sub_id, user_id, 0)
     elif action == "resume":
-        toggle_subscription(sub_id, user_id, 1)
-        await query.edit_message_text("▶️ Подписка возобновлена.")
+        toggle_sub(sub_id, user_id, 1)
     elif action == "delete":
-        delete_subscription(sub_id, user_id)
-        await query.edit_message_text("❌ Подписка удалена.")
-    # Обновим список подписок
-    await my_subscriptions(update, context)
+        delete_sub(sub_id, user_id)
+    await list_subs(update, context)
 
-# ---------- Остальные кнопки ----------
+# === Прочие команды ===
 async def pause_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
-    subs = get_subscriptions(active_only=False)
+    subs = get_subs(active_only=False)
     for s in subs:
         if s[1] == user_id and s[7] == 1:
-            toggle_subscription(s[0], user_id, 0)
-    await query.edit_message_text("⏸ Все подписки приостановлены.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="back_main")]]))
+            toggle_sub(s[0], user_id, 0)
+    await query.edit_message_text("⏸ Все подписки приостановлены.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="back")]]))
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     await query.edit_message_text(
-        "🤖 Бот помогает отслеживать:\n"
-        "1️⃣ Субсидированные билеты Аэрофлота – уведомление при появлении мест\n"
-        "2️⃣ Дешёвые билеты через Aviasales – при падении цены ниже порога\n\n"
-        "Используйте кнопки для настройки. Все данные сохраняются в базе.",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="back_main")]])
+        "🤖 Бот ищет:\n1) Субсидии Аэрофлота\n2) Дешёвые билеты Aviasales\n\nИспользуйте кнопки.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="back")]])
     )
 
-async def back_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    # Просто показываем главное меню через start
-    await start(update, context)
+    # Просто показываем главное меню
+    keyboard = [
+        [InlineKeyboardButton("🔍 Новый поиск", callback_data="new")],
+        [InlineKeyboardButton("📋 Мои подписки", callback_data="list")],
+        [InlineKeyboardButton("❓ Помощь", callback_data="help")],
+        [InlineKeyboardButton("⏸ Приостановить все", callback_data="pause_all")]
+    ]
+    await query.edit_message_text("✈️ Главное меню:", reply_markup=InlineKeyboardMarkup(keyboard))
 
-# ---------- Вспомогательная функция для получения подписки по id ----------
-def get_subscription_by_id(sub_id):
-    with db_lock:
-        conn = sqlite3.connect(DB_NAME)
-        c = conn.cursor()
-        c.execute("SELECT user_id, type, origin, destination, date_from, date_to, max_price, category, airline FROM subscriptions WHERE id=?", (sub_id,))
-        row = c.fetchone()
-        conn.close()
-        return row
-
-# ---------- Периодическая проверка ----------
-def check_all_subscriptions(context: ContextTypes.DEFAULT_TYPE):
-    subs = get_subscriptions(active_only=True)
+# === Периодическая проверка ===
+def check_all(context: ContextTypes.DEFAULT_TYPE):
+    subs = get_subs(active_only=True)
     for sub in subs:
-        sub_id, user_id, sub_type, origin, dest, date_from, date_to, max_price, category, airline = sub
-        if sub_type == 'subsidy':
-            tickets = fetch_subsidy_flights(origin, dest, date_from, date_to, category)
-            for ticket in tickets:
-                add_found_ticket(sub_id, ticket["date"], ticket["price"], ticket["link"])
-                keyboard = [[InlineKeyboardButton("✈️ Купить", url=ticket["link"])]]
+        sub_id, user_id, typ, origin, dest, d_from, d_to, max_price, category, airline = sub
+        if typ == 'subsidy':
+            tickets = fetch_subsidy(origin, dest, d_from, d_to, category)
+            for t in tickets:
+                add_found(sub_id, t["date"], t["price"], t["link"])
+                keyboard = [[InlineKeyboardButton("✈️ Купить", url=t["link"])]]
                 context.bot.send_message(
                     chat_id=user_id,
-                    text=f"🎫 СУБСИДИРОВАННЫЙ БИЛЕТ ПОЯВИЛСЯ!\n\n"
-                         f"📍 {origin} → {dest}\n"
-                         f"📅 {ticket['date']}\n"
-                         f"💵 Цена фиксированная (льготная)\n"
-                         f"❗ Успейте купить, места ограничены!",
+                    text=f"🎫 СУБСИДИРОВАННЫЙ БИЛЕТ ПОЯВИЛСЯ!\n📍 {origin}→{dest}\n📅 {t['date']}",
                     reply_markup=InlineKeyboardMarkup(keyboard)
                 )
-        elif sub_type == 'aviasales':
-            result = fetch_aviasales_price(origin, dest, date_from, date_to)
-            if result and max_price and result["price"] <= max_price:
-                add_found_ticket(sub_id, result["date"], result["price"], None)
-                keyboard = [[InlineKeyboardButton("✈️ Купить", url=f"https://www.aviasales.ru/search/{origin}{dest}{result['date']}")]]
+        else:
+            res = fetch_aviasales(origin, dest, d_from, d_to)
+            if res and max_price and res["price"] <= max_price:
+                add_found(sub_id, res["date"], res["price"], None)
+                link = f"https://www.aviasales.ru/search/{origin}{dest}{d_from}"
+                keyboard = [[InlineKeyboardButton("✈️ Купить", url=link)]]
                 context.bot.send_message(
                     chat_id=user_id,
-                    text=f"💰 НАЙДЕН БИЛЕТ ПО ВАШЕЙ ЦЕНЕ!\n\n"
-                         f"📍 {origin} → {dest}\n"
-                         f"📅 {result['date']}\n"
-                         f"💵 {result['price']} ₽ (ваш порог: {max_price} ₽)\n"
-                         f"🔄 Цена может вырасти!",
+                    text=f"💰 НАЙДЕН БИЛЕТ!\n📍 {origin}→{dest}\n📅 {res['date']}\n💵 {res['price']} ₽ (порог {max_price} ₽)",
                     reply_markup=InlineKeyboardMarkup(keyboard)
                 )
 
-# ---------- Главная функция ----------
+# === Main ===
 def main():
     init_db()
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # ConversationHandler для нового поиска
-    conv_handler = ConversationHandler(
-        entry_points=[CallbackQueryHandler(start_new_search, pattern="^new_search$")],
+    conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(new_search, pattern="^new$")],
         states={
-            SELECT_TYPE: [CallbackQueryHandler(select_type, pattern="^type_")],
-            SELECT_ORIGIN: [
-                CallbackQueryHandler(select_origin, pattern="^origin_"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, enter_city_origin),
-            ],
-            SELECT_DEST: [
-                CallbackQueryHandler(select_destination, pattern="^dest_"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, enter_city_dest),
-            ],
-            SELECT_DATE_FROM: [CallbackQueryHandler(calendar_callback, pattern="^(date_from|ignore|date_from_prev|date_from_next)")],
-            SELECT_DATE_TO: [CallbackQueryHandler(calendar_callback, pattern="^(date_to|ignore|date_to_prev|date_to_next)")],
-            SELECT_PRICE: [
-                CallbackQueryHandler(select_price, pattern="^price_"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_price_input),
-            ],
-            SELECT_AIRLINE: [CallbackQueryHandler(select_airline, pattern="^airline_")],
-            ENTER_CITY_ORIGIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_city_origin)],
-            ENTER_CITY_DEST: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_city_dest)],
+            TYPE: [CallbackQueryHandler(type_chosen, pattern="^type_")],
+            ORIGIN: [CallbackQueryHandler(origin_chosen, pattern="^origin_"), MessageHandler(filters.TEXT & ~filters.COMMAND, origin_manual)],
+            DEST: [CallbackQueryHandler(dest_chosen, pattern="^dest_"), MessageHandler(filters.TEXT & ~filters.COMMAND, dest_manual)],
+            DATE_FROM: [CallbackQueryHandler(calendar_handler, pattern="^(from|from_prev|from_next|ignore)")],
+            DATE_TO: [CallbackQueryHandler(calendar_handler, pattern="^(to|to_prev|to_next|ignore)")],
+            PRICE: [CallbackQueryHandler(price_chosen, pattern="^price_"), MessageHandler(filters.TEXT & ~filters.COMMAND, price_manual)],
+            AIRLINE: [CallbackQueryHandler(airline_chosen, pattern="^airline_")],
+            CITY_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, origin_manual)],  # общий, но будет работать
         },
-        fallbacks=[CommandHandler("start", start), CallbackQueryHandler(back_main, pattern="^back_main$")],
-        per_user=True,
+        fallbacks=[CallbackQueryHandler(back, pattern="^back$")],
+        per_user=True
     )
+    app.add_handler(conv)
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(start, pattern="^back$"))  # если из главного меню
+    app.add_handler(CallbackQueryHandler(list_subs, pattern="^list$"))
+    app.add_handler(CallbackQueryHandler(manage_sub, pattern="^(pause|resume|delete)_"))
+    app.add_handler(CallbackQueryHandler(pause_all, pattern="^pause_all$"))
+    app.add_handler(CallbackQueryHandler(help_cmd, pattern="^help$"))
+    app.add_handler(CallbackQueryHandler(back, pattern="^back$"))
 
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CallbackQueryHandler(start_new_search, pattern="^new_search$"))
-    application.add_handler(CallbackQueryHandler(select_type, pattern="^type_"))
-    application.add_handler(CallbackQueryHandler(select_origin, pattern="^origin_"))
-    application.add_handler(CallbackQueryHandler(select_destination, pattern="^dest_"))
-    application.add_handler(CallbackQueryHandler(calendar_callback, pattern="^(date_from|date_to|ignore|date_from_prev|date_from_next|date_to_prev|date_to_next)"))
-    application.add_handler(CallbackQueryHandler(select_price, pattern="^price_"))
-    application.add_handler(CallbackQueryHandler(select_airline, pattern="^airline_"))
-    application.add_handler(CallbackQueryHandler(my_subscriptions, pattern="^my_subs$"))
-    application.add_handler(CallbackQueryHandler(manage_subscription, pattern="^(pause|resume|delete)_"))
-    application.add_handler(CallbackQueryHandler(pause_all, pattern="^pause_all$"))
-    application.add_handler(CallbackQueryHandler(help_command, pattern="^help$"))
-    application.add_handler(CallbackQueryHandler(back_main, pattern="^back_main$"))
-    application.add_handler(conv_handler)
-
-    # Планировщик
     scheduler = BackgroundScheduler()
-    scheduler.add_job(check_all_subscriptions, 'interval', minutes=CHECK_INTERVAL_MINUTES, args=[application])
+    scheduler.add_job(check_all, 'interval', minutes=CHECK_INTERVAL, args=[app])
     scheduler.start()
 
-    application.run_polling()
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
